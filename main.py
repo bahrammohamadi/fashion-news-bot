@@ -1,3 +1,11 @@
+# main.py - بات تلگرام اخبار مد و فشن ایرانی
+# نسخه نهایی بدون وابستگی به SDK appwrite (با requests خام)
+# فقط ۱ پست در هر اجرا
+# فیلتر ساده کلمات کلیدی برای مد و فشن
+# عکس از RSS یا og:image صفحه خبر
+# چک تکراری با لینک و hash محتوا
+# ذخیره در Appwrite با requests خام
+
 import os
 import asyncio
 import feedparser
@@ -30,7 +38,7 @@ async def main(event=None, context=None):
         'X-Appwrite-Key': key,
     }
 
-    # فیدهای تخصصی مد، فشن، زیبایی و استایل ایرانی
+    # ۲۰ فید تخصصی مد، فشن، زیبایی و استایل ایرانی
     rss_feeds = [
         "https://medopia.ir/feed/",
         "https://www.digistyle.com/mag/feed/",
@@ -59,13 +67,6 @@ async def main(event=None, context=None):
 
     posted = False
 
-    # کلمات کلیدی برای فیلتر مد و فشن (فارسی)
-    fashion_keywords = [
-        'مد', 'فشن', 'استایل', 'لباس', 'پوشاک', 'ترند', 'زیبایی', 'آرایش', 'مو', 'کفش', 'کیف', 'اکسسوری', 
-        'طراحی لباس', 'کوتور', 'مانتو', 'شال', 'روسری', 'پوشش', 'مد روز', 'فشن شو', 'کفش زنانه', 'لباس مجلسی',
-        'استایل خیابانی', 'ترند ۲۰۲۶', 'مد ایرانی', 'فشن ایرانی'
-    ]
-
     for url in rss_feeds:
         if posted:
             break
@@ -73,6 +74,7 @@ async def main(event=None, context=None):
         try:
             feed = feedparser.parse(url)
             if not feed.entries:
+                print(f"[INFO] فید خالی: {url}")
                 continue
 
             for entry in feed.entries:
@@ -94,48 +96,57 @@ async def main(event=None, context=None):
 
                 description = (entry.get('summary') or entry.get('description') or "").strip()
 
-                # فیلتر هوشمند: فقط خبرهایی که حداقل یک کلمه کلیدی مد داشته باشن
-                text_for_filter = (title + " " + description).lower()
-                is_fashion = any(keyword.lower() in text_for_filter for keyword in fashion_keywords)
-
-                if not is_fashion:
-                    print(f"[FILTER] رد شد (غیرمد): {title[:70]}")
+                # فیلتر ساده مد و فشن (بدون API خارجی)
+                if not is_fashion_related(title, description):
+                    print(f"[SKIP] غیرمرتبط با مد و فشن: {title[:70]}")
                     continue
 
                 # ساخت hash برای تشخیص محتوای مشابه
                 content_for_hash = (title.lower().strip() + " " + description[:150].lower().strip())
                 content_hash = hashlib.sha256(content_for_hash.encode('utf-8')).hexdigest()
 
-                # چک تکراری
+                # چک تکراری با Appwrite (با requests خام)
                 is_duplicate = False
                 try:
+                    # چک لینک
                     params_link = {'queries[0]': f'equal("link", ["{link}"])', 'limit': 1}
                     res_link = requests.get(
                         f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents",
                         headers=headers,
-                        params=params_link
+                        params=params_link,
+                        timeout=10
                     )
-                    if res_link.status_code == 200 and res_link.json().get('total', 0) > 0:
-                        is_duplicate = True
-                        print(f"[SKIP] تکراری (لینک): {title[:70]}")
+                    if res_link.status_code == 200:
+                        data_link = res_link.json()
+                        if data_link.get('total', 0) > 0:
+                            is_duplicate = True
+                            print(f"[SKIP] تکراری (لینک): {title[:70]}")
+                    else:
+                        print(f"[WARN] خطا چک لینک: {res_link.status_code} - {res_link.text}")
 
+                    # چک hash اگر لینک تکراری نبود
                     if not is_duplicate:
                         params_hash = {'queries[0]': f'equal("content_hash", ["{content_hash}"])', 'limit': 1}
                         res_hash = requests.get(
                             f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents",
                             headers=headers,
-                            params=params_hash
+                            params=params_hash,
+                            timeout=10
                         )
-                        if res_hash.status_code == 200 and res_hash.json().get('total', 0) > 0:
-                            is_duplicate = True
-                            print(f"[SKIP] تکراری (محتوا): {title[:70]}")
+                        if res_hash.status_code == 200:
+                            data_hash = res_hash.json()
+                            if data_hash.get('total', 0) > 0:
+                                is_duplicate = True
+                                print(f"[SKIP] تکراری (محتوا): {title[:70]}")
+                        else:
+                            print(f"[WARN] خطا چک hash: {res_hash.status_code} - {res_hash.text}")
                 except Exception as e:
-                    print(f"[WARN] خطا چک تکراری: {str(e)}")
+                    print(f"[WARN] خطا در چک تکراری: {str(e)} - ادامه بدون چک")
 
                 if is_duplicate:
                     continue
 
-                # پست حرفه‌ای بدون تکرار
+                # فرمت پست حرفه‌ای مد و فشن (بدون جمله تکراری)
                 final_text = (
                     f"💠 <b>{title}</b>\n\n"
                     f"{description}\n\n"
@@ -143,6 +154,7 @@ async def main(event=None, context=None):
                     f"🆔 @irfashionnews"
                 )
 
+                # عکس از RSS یا og:image صفحه
                 image_url = None
                 if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
                     image_url = entry.enclosure.href
@@ -154,7 +166,7 @@ async def main(event=None, context=None):
 
                 # اگر RSS عکس نداشت، از صفحه خبر بکش
                 if not image_url:
-                    image_url = await get_image_from_web(link)
+                    image_url = get_og_image_from_page(link)
 
                 try:
                     if image_url:
@@ -175,9 +187,9 @@ async def main(event=None, context=None):
                         )
 
                     posted = True
-                    print(f"[SUCCESS] ارسال موفق: {title[:70]} - عکس: {'دارد' if image_url else 'ندارد'}")
+                    print(f"[SUCCESS] ارسال موفق: {title[:70]}")
 
-                    # ذخیره لینک و hash
+                    # ذخیره لینک و hash با requests خام
                     try:
                         payload = {
                             'documentId': 'unique()',
@@ -186,18 +198,19 @@ async def main(event=None, context=None):
                                 'title': title[:300],
                                 'content_hash': content_hash,
                                 'created_at': now.isoformat(),
-                                'source_type': get_source_name(url)  # ← اضافه کردن منبع فارسی
+                                'source_type': get_source_type(url)  # فیلد منبع فارسی
                             }
                         }
                         res = requests.post(
                             f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents",
                             headers=headers,
-                            json=payload
+                            json=payload,
+                            timeout=10
                         )
                         if res.status_code in (200, 201):
                             print("[DB] ذخیره موفق")
                         else:
-                            print(f"[WARN] ذخیره شکست: {res.status_code}")
+                            print(f"[WARN] ذخیره شکست: {res.status_code} - {res.text}")
                     except Exception as save_err:
                         print(f"[WARN] خطا ذخیره دیتابیس: {str(save_err)}")
 
@@ -205,13 +218,24 @@ async def main(event=None, context=None):
                     print(f"[ERROR] خطا ارسال: {str(send_err)}")
 
         except Exception as feed_err:
-            print(f"[ERROR] مشکل فید {url}: {str(feed_err)}")
+            print(f"[ERROR] مشکل در فید {url}: {str(feed_err)}")
 
     print(f"[INFO] پایان اجرا - ارسال شد: {posted}")
     return {"status": "success", "posted": posted}
 
 
-def get_source_name(url):
+def is_fashion_related(title, description):
+    # فیلتر ساده کلمات کلیدی مد و فشن (داخل کد، بدون API)
+    keywords = [
+        'مد', 'فشن', 'استایل', 'زیبایی', 'لباس', 'پوشاک', 'طراحی لباس', 'ترند', 'کفش', 'مانتو', 'شال', 'روسری',
+        'fashion', 'style', 'beauty', 'clothing', 'trend', 'outfit', 'couture', 'runway', 'collection', 'designer'
+    ]
+    combined = (title + ' ' + description).lower()
+    return any(kw in combined for kw in keywords)
+
+
+def get_source_type(feed_url):
+    # استخراج نام فارسی منبع برای فیلد source_type
     mapping = {
         "medopia.ir": "مدوپیا",
         "digistyle.com": "دیجی‌استایل",
@@ -234,51 +258,35 @@ def get_source_name(url):
         "fararu.com": "فرارو مد",
         "digikala.com": "دیجی‌کالا مد",
     }
+    
     for domain, name in mapping.items():
-        if domain in url:
+        if domain in feed_url:
             return name
-    return "مد ایرانی"
+    
+    return "منبع نامشخص"
 
 
-async def get_image_from_web(url):
+def get_og_image_from_page(link):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, timeout=10, headers=headers)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(link, timeout=10, headers=headers)
         if response.status_code != 200:
             return None
 
         soup = BeautifulSoup(response.text, 'html.parser')
+        og_image = soup.find('meta', attrs={'property': 'og:image'})
+        if og_image and og_image.get('content'):
+            return og_image['content']
 
-        # og:image بهترین گزینه
-        og = soup.find('meta', property='og:image')
-        if og and og.get('content'):
-            return og['content']
-
-        # اولین عکس بزرگ صفحه
+        # اگر og:image نبود، اولین img بزرگ
         for img in soup.find_all('img'):
-            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-            if src and len(src) > 15:
-                if any(bad in src.lower() for bad in ['logo', 'icon', 'banner', 'advert', 'pixel']):
-                    continue
-                if src.startswith('//'):
-                    return 'https:' + src
-                if src.startswith('/'):
-                    return 'https://' + url.split('/')[2] + src
+            src = img.get('src') or img.get('data-src')
+            if src and len(src) > 15 and 'logo' not in src.lower() and 'icon' not in src.lower():
                 return src
         return None
     except Exception as e:
         print(f"[WARN] خطا استخراج عکس: {str(e)}")
         return None
-
-
-def get_image_from_rss(entry):
-    if 'enclosure' in entry and entry.enclosure.get('type', '').startswith('image/'):
-        return entry.enclosure.href
-    if 'media_content' in entry:
-        for media in entry.media_content:
-            if media.get('medium') == 'image' and media.get('url'):
-                return media['url']
-    return None
 
 
 if __name__ == "__main__":
