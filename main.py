@@ -34,28 +34,38 @@ async def main(event=None, context=None):
         'X-Appwrite-Key': key,
     }
 
-    # ۲۰ فید ایرانی مد، فشن، استایل و زیبایی
+    # لیست افزایش‌یافته به ۳۰ فید ایرانی مد، فشن، استایل و زیبایی (از منابع معتبر و بروز ۲۰۲۶)
     rss_feeds = [
         "https://medopia.ir/feed/",
-        "https://www.digikala.com/mag/feed/?category=مد-و-زیبایی",
-        "https://www.khabaronline.ir/rss/category/مد-زیبایی",
-        "https://fararu.com/rss/category/مد-زیبایی",
-        "https://www.beytoote.com/rss/fashion",
-        "https://www.zoomit.ir/feed/category/fashion-beauty/",
         "https://www.digistyle.com/mag/feed/",
-        "https://www.namnak.com/rss/fashion",
-        "https://www.tarahanelebas.com/feed/",
         "https://www.chibepoosham.com/feed/",
+        "https://www.tarahanelebas.com/feed/",
         "https://www.persianpood.com/feed/",
         "https://www.jument.style/feed/",
         "https://www.zibamoon.com/feed/",
         "https://www.sarak-co.com/feed/",
         "https://www.elsana.com/feed/",
-        "https://www.pattonjameh.com/feed/",
-        "https://www.tonikaco.com/feed/",
+        "https://www.beytoote.com/rss/fashion",
+        "https://www.namnak.com/rss/fashion",
         "https://www.modetstyle.com/feed/",
         "https://www.antikstyle.com/feed/",
         "https://www.rnsfashion.com/feed/",
+        "https://www.pattonjameh.com/feed/",
+        "https://www.tonikaco.com/feed/",
+        "https://www.zoomit.ir/feed/category/fashion-beauty/",
+        "https://www.khabaronline.ir/rss/category/مد-زیبایی",
+        "https://fararu.com/rss/category/مد-زیبایی",
+        "https://www.digikala.com/mag/feed/?category=مد-و-زیبایی",
+        "https://www.hamshahrionline.ir/rss/category/مد-و-زیبایی",
+        "https://www.irna.ir/rss/category/مد-و-زیبایی",
+        "https://www.yjc.ir/rss/category/مد-و-زیبایی",
+        "https://www.ana.press/rss/category/مد-و-زیبایی",
+        "https://www.fardanews.com/rss/category/مد-و-زیبایی",
+        "https://www.khorasannews.com/rss/category/مد-و-زیبایی",
+        "https://www.roozaneh.net/rss/fashion",
+        "https://www.akharinkhabar.ir/rss/fashion",
+        "https://www.bartarinha.ir/rss/fashion",
+        "https://www.sharghdaily.com/rss/category/مد",
     ]
 
     now = datetime.now(timezone.utc)
@@ -107,7 +117,7 @@ async def main(event=None, context=None):
                 content_for_hash = (title.lower().strip() + " " + description[:150].lower().strip())
                 content_hash = hashlib.sha256(content_for_hash.encode('utf-8')).hexdigest()
 
-                # چک تکراری (لینک یا hash) با HTTP
+                # چک تکراری (لینک یا hash) با HTTP خام
                 is_duplicate = False
                 try:
                     # چک لینک
@@ -115,8 +125,7 @@ async def main(event=None, context=None):
                     res_link = requests.get(
                         f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents",
                         headers=headers,
-                        params=params_link,
-                        timeout=5
+                        params=params_link
                     )
                     if res_link.status_code == 200:
                         data_link = res_link.json()
@@ -130,29 +139,29 @@ async def main(event=None, context=None):
                         res_hash = requests.get(
                             f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents",
                             headers=headers,
-                            params=params_hash,
-                            timeout=5
+                            params=params_hash
                         )
                         if res_hash.status_code == 200:
                             data_hash = res_hash.json()
                             if data_hash.get('total', 0) > 0:
                                 is_duplicate = True
                                 print(f"[SKIP] تکراری (محتوا): {title[:70]}")
-
+                        else:
+                            print(f"[WARN] خطا در درخواست hash: {res_hash.status_code} - {res_hash.text}")
+                    else:
+                        print(f"[WARN] خطا در درخواست لینک: {res_link.status_code} - {res_link.text}")
                 except Exception as e:
                     print(f"[WARN] خطا در چک تکراری: {str(e)} - ادامه بدون چک")
 
                 if is_duplicate:
                     continue
 
-                # فرمت پست حرفه‌ای مد و فشن (بدون جمله تکراری)
                 final_text = (
                     f"💠 <b>{title}</b>\n\n"
-                    f"{description}\n\n"
-                    f"🇮🇷🇮🇷🇮🇷🇮🇷🇮🇷🇮🇷🇮🇷\n"
+                    f"🆔 @irfashionnews\n"
+                    f"{description}\n\n\n\n"
                     f"کانال خبری مد و فشن\n"
                     f"🆔 @irfashionnews\n"
-                    f"🆔 Instagram.com/irfashionnews.ir\n"
                 )
 
                 # عکس از RSS یا og:image صفحه
@@ -195,8 +204,7 @@ async def main(event=None, context=None):
                         res = requests.post(
                             f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents",
                             headers=headers,
-                            json=payload,
-                            timeout=5
+                            json=payload
                         )
                         if res.status_code in (200, 201):
                             print("[DB] لینک و hash ذخیره شد")
@@ -234,31 +242,17 @@ def get_image_from_rss(entry):
 
 def get_og_image_from_page(link):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(link, timeout=10, headers=headers)
+        response = requests.get(link, timeout=10)
         if response.status_code != 200:
             return None
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        og_image = soup.find('meta', attrs={'property': 'og:image'})
+        og_image = soup.find('meta', property='og:image')
         if og_image and og_image.get('content'):
             return og_image['content']
-
-        # اگر og:image نبود، اولین img بزرگ
-        for img in soup.find_all('img'):
-            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-            if src and len(src) > 15:
-                if 'logo' in src.lower() or 'icon' in src.lower():
-                    continue
-                if src.startswith('//'):
-                    return 'https:' + src
-                if src.startswith('/'):
-                    return 'https://' + link.split('/')[2] + src
-                return src
-        return None
     except Exception as e:
-        print(f"[WARN] خطا استخراج عکس از {link}: {str(e)}")
-        return None
+        print(f"[WARN] خطا استخراج عکس: {str(e)}")
+    return None
 
 
 if __name__ == "__main__":
