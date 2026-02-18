@@ -1,6 +1,5 @@
 # main.py - بات تلگرام اخبار مد و فشن ایرانی
-# نسخه نهایی با چک تکراری، فیلتر مد، عکس از RSS یا og:image، فقط ۱ پست در هر اجرا
-# فرمت پست شبیه نمونه (با 💠 تیتر + توضیح + هشتگ + منبع + لینک)
+# نسخه نهایی با چک تکراری، فیلتر قوی مد، عکس از RSS یا og:image، فقط ۱ پست در هر اجرا
 
 import os
 import asyncio
@@ -34,7 +33,7 @@ async def main(event=None, context=None):
         'X-Appwrite-Key': key,
     }
 
-    # لیست افزایش‌یافته به ۳۰ فید ایرانی مد، فشن، استایل و زیبایی (از منابع معتبر و بروز ۲۰۲۶)
+    # لیست ۳۰ فید ایرانی مد، فشن، استایل و زیبایی
     rss_feeds = [
         "https://medopia.ir/feed/",
         "https://www.digistyle.com/mag/feed/",
@@ -102,13 +101,13 @@ async def main(event=None, context=None):
 
                 raw_description = (entry.get('summary') or entry.get('description') or "").strip()
 
-                # پاک کردن کامل HTML از description
+                # پاک کردن کامل HTML
                 soup = BeautifulSoup(raw_description, 'html.parser')
                 description = soup.get_text(separator=' ').strip()
                 if len(description) > 400:
                     description = description[:400] + "..."
 
-                # فیلتر ساده مد و فشن
+                # فیلتر قوی مد و فشن
                 if not is_fashion_related(title, description):
                     print(f"[SKIP] غیرمرتبط با مد و فشن: {title[:70]}")
                     continue
@@ -117,7 +116,7 @@ async def main(event=None, context=None):
                 content_for_hash = (title.lower().strip() + " " + description[:150].lower().strip())
                 content_hash = hashlib.sha256(content_for_hash.encode('utf-8')).hexdigest()
 
-                # چک تکراری (لینک یا hash) با HTTP خام
+                # چک تکراری (لینک یا hash)
                 is_duplicate = False
                 try:
                     # چک لینک
@@ -146,10 +145,6 @@ async def main(event=None, context=None):
                             if data_hash.get('total', 0) > 0:
                                 is_duplicate = True
                                 print(f"[SKIP] تکراری (محتوا): {title[:70]}")
-                        else:
-                            print(f"[WARN] خطا در درخواست hash: {res_hash.status_code} - {res_hash.text}")
-                    else:
-                        print(f"[WARN] خطا در درخواست لینک: {res_link.status_code} - {res_link.text}")
                 except Exception as e:
                     print(f"[WARN] خطا در چک تکراری: {str(e)} - ادامه بدون چک")
 
@@ -158,9 +153,8 @@ async def main(event=None, context=None):
 
                 final_text = (
                     f"💠 <b>{title}</b>\n\n"
-                    f"🆔 @irfashionnews\n"
-                    f"{description}\n\n\n\n"
-                    f"کانال خبری مد و فشن\n"
+                    f"{description}\n\n"
+                    f"#مد #استایل #ترند #فشن_ایرانی #مهرجامه\n"
                     f"🆔 @irfashionnews\n"
                 )
 
@@ -224,10 +218,17 @@ async def main(event=None, context=None):
 
 
 def is_fashion_related(title, description):
-    # فیلتر ساده کلمات کلیدی مد و فشن (داخل کد، بدون API)
-    keywords = ['مد', 'فشن', 'استایل', 'زیبایی', 'لباس', 'پوشاک', 'طراحی لباس', 'ترند', 'fashion', 'style', 'beauty', 'clothing', 'trend', 'outfit', 'couture', 'runway']
-    combined = (title + ' ' + description).lower()
-    return any(kw in combined for kw in keywords)
+    # کلمات مثبت قوی
+    positive = ['مد', 'فشن', 'استایل', 'زیبایی', 'لباس', 'پوشاک', 'طراحی لباس', 'ترند', 'fashion', 'style', 'beauty', 'clothing', 'trend', 'outfit', 'couture', 'runway']
+    # کلمات منفی قوی (اگر باشه رد کن)
+    negative = ['فیلم', 'سینما', 'سریال', 'بازی', 'گیم', 'تریلر', 'نقد', 'بازیگر', 'صبحانه', 'روغن', 'عینک', 'اپل', 'گوگل', 'پیکسل', 'رم', 'آلزایمر']
+
+    text = (title + ' ' + description).lower()
+
+    if any(kw in text for kw in negative):
+        return False
+
+    return any(kw in text for kw in positive)
 
 
 def get_image_from_rss(entry):
@@ -242,16 +243,17 @@ def get_image_from_rss(entry):
 
 def get_og_image_from_page(link):
     try:
-        response = requests.get(link, timeout=10)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(link, timeout=8, headers=headers)
         if response.status_code != 200:
             return None
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        og_image = soup.find('meta', property='og:image')
-        if og_image and og_image.get('content'):
-            return og_image['content']
-    except Exception as e:
-        print(f"[WARN] خطا استخراج عکس: {str(e)}")
+        og = soup.find('meta', property='og:image')
+        if og and og.get('content'):
+            return og['content']
+    except:
+        pass
     return None
 
 
