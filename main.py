@@ -1,21 +1,56 @@
+# ============================================================
+# Telegram Fashion News Bot — @irfashionnews
+# Version:    10.0 — Persian Fashion Feed, Full Rewrite
+# Runtime:    Python 3.12 / Appwrite Cloud Functions
+# Timeout:    120 seconds
+#
+# POSTING SEQUENCE (guaranteed order):
+#   ① send_media_group(all images, no caption)
+#      → captures anchor = last_message.message_id
+#   ② asyncio.sleep(2.0)
+#   ③ send_message(caption, reply_to=anchor)
+#      → structural reply enforces Telegram ordering
+#   ④ asyncio.sleep(1.5)
+#   ⑤ send_sticker(random fashion sticker) [non-fatal]
+#
+# DUPLICATE PROTECTION:
+#   - Exact URL match
+#   - SHA256 content hash (title + description)
+#   - Both checked via Appwrite REST before posting
+#
+# CONTENT FILTER:
+#   - POSITIVE_KEYWORDS: must match at least one
+#   - NEGATIVE_KEYWORDS: any match = hard reject
+#
+# CAPTION FORMAT (magazine style, HTML):
+#   💠 Bold Title
+#   ─────────────
+#   Short description (max 350 chars)
+#
+#   🔗 ادامه مطلب | @irfashionnews
+#
+#   #مد #استایل #ترند #فشن_ایرانی #زیبایی
+# ============================================================
+
 import os
 import asyncio
-import feedparser
-import requests
 import hashlib
-import json
+import re
+import requests
+import feedparser
+
 from datetime import datetime, timedelta, timezone
-from telegram import Bot, LinkPreviewOptions
-from telegram.error import TelegramError
 from bs4 import BeautifulSoup
+from telegram import Bot, InputMediaPhoto, LinkPreviewOptions
+from telegram.error import TelegramError
 
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 1 — CONFIGURATION
+# ═══════════════════════════════════════════════════════════
 
 RSS_FEEDS = [
-    # ✅ Dedicated fashion/style sources (highest priority)
+    # Persian fashion-dedicated sources
     "https://medopia.ir/feed/",
     "https://www.digistyle.com/mag/feed/",
     "https://www.chibepoosham.com/feed/",
@@ -27,386 +62,393 @@ RSS_FEEDS = [
     "https://www.namnak.com/rss/fashion",
     "https://www.roozaneh.net/rss/fashion",
     "https://www.bartarinha.ir/rss/fashion",
-    # ✅ General news - fashion category only
+    # Persian general — fashion category only
     "https://www.zoomit.ir/feed/category/fashion-beauty/",
     "https://fararu.com/rss/category/مد-زیبایی",
     "https://www.digikala.com/mag/feed/?category=مد-و-زیبایی",
 ]
 
-# Keywords that MUST appear for the post to be published
+# ── Content filtering ──
 POSITIVE_KEYWORDS = [
+    # Persian
     'مد', 'فشن', 'استایل', 'زیبایی', 'لباس', 'پوشاک',
     'طراحی لباس', 'ترند', 'کلکسیون', 'برند', 'سیزن',
-    'fashion', 'style', 'beauty', 'clothing', 'trend',
-    'outfit', 'couture', 'runway', 'lookbook', 'textile',
     'آرایش', 'مانتو', 'پیراهن', 'کت', 'شلوار', 'کیف',
     'کفش', 'اکسسوری', 'جواهر', 'طلا', 'عطر', 'نگین',
+    'پالتو', 'ست لباس', 'مزون', 'خیاطی', 'بافت',
+    # English
+    'fashion', 'style', 'beauty', 'clothing', 'trend',
+    'outfit', 'couture', 'runway', 'lookbook', 'textile',
+    'wardrobe', 'luxury', 'brand', 'collection', 'designer',
+    'chanel', 'dior', 'gucci', 'prada', 'zara', 'h&m',
+    'streetwear', 'accessory', 'jewelry', 'fragrance',
 ]
 
-# Keywords that immediately REJECT the post
 NEGATIVE_KEYWORDS = [
-    'فیلم', 'سینما', 'سریال', 'بازی', 'گیم', 'تریلر',
-    'نقد فیلم', 'بازیگر', 'کارگردان', 'اسکار',
-    'صبحانه', 'رژیم غذایی', 'طرز تهیه', 'دستور پخت',
-    'اپل', 'گوگل', 'پیکسل', 'آیفون', 'سامسونگ',
-    'فوتبال', 'والیبال', 'ورزش', 'تیم ملی', 'لیگ',
-    'بورس', 'ارز', 'دلار', 'سکه', 'بیت کوین',
-    'انتخابات', 'سیاسی', 'مجلس', 'دولت', 'وزیر',
-    'زلزله', 'سیل', 'آتش سوزی', 'تصادف', 'حادثه',
+    # Entertainment
+    'فیلم', 'سینما', 'سریال', 'بازیگر', 'کارگردان', 'اسکار',
+    # Food
+    'صبحانه', 'رژیم غذایی', 'طرز تهیه', 'دستور پخت', 'آشپزی',
+    # Tech
+    'اپل', 'گوگل', 'آیفون', 'سامسونگ', 'تکنولوژی', 'گیم',
+    # Sports
+    'فوتبال', 'والیبال', 'ورزش', 'تیم ملی', 'لیگ', 'مسابقه',
+    # Finance
+    'بورس', 'ارز', 'دلار', 'سکه', 'بیت کوین', 'اقتصاد',
+    # Politics
+    'انتخابات', 'سیاسی', 'مجلس', 'دولت', 'وزیر', 'رئیس جمهور',
+    # Accidents
+    'زلزله', 'سیل', 'آتش سوزی', 'تصادف', 'حادثه', 'کشته',
 ]
 
-MAX_DESCRIPTION_LENGTH = 350
-FEED_TIMEOUT = 10       # seconds for RSS fetch
-PAGE_TIMEOUT = 8        # seconds for og:image page fetch
-DB_TIMEOUT = 6          # seconds for Appwrite API calls
-HOURS_THRESHOLD = 48    # how old can a post be (hours)
+# ── Limits & timeouts ──
+MAX_DESCRIPTION_CHARS = 350
+MAX_IMAGES            = 5
+FEED_TIMEOUT          = 10
+PAGE_TIMEOUT          = 8
+DB_TIMEOUT            = 6
+HOURS_THRESHOLD       = 48
+ALBUM_CAPTION_DELAY   = 2.0
+STICKER_DELAY         = 1.5
+
+# ── Valid image extensions ──
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
+
+# ── Fixed Persian + English hashtags ──
+FIXED_HASHTAGS = "#مد #استایل #ترند #فشن_ایرانی #زیبایی #fashion #style"
+
+# ── Fashion stickers ──
+# Replace with real file_ids:
+# 1. Send a sticker to your bot
+# 2. GET https://api.telegram.org/bot<TOKEN>/getUpdates
+# 3. Copy result[0].message.sticker.file_id
+FASHION_STICKERS = [
+    "CAACAgIAAxkBAAIBmGRx1yRFMVhVqVXLv_dAAXJMOdFNAAIUAAOVgnkAAVGGBbBjxbg4LwQ",
+    "CAACAgIAAxkBAAIBmWRx1yRqy9JkN2DmV_Z2sRsKdaTjAAIVAAOVgnkAAc8R3q5p5-AELAQ",
+    "CAACAgIAAxkBAAIBmmRx1yS2T2gfLqJQX9oK6LZqp1HIAAIWAAO0yXAAAV0MzCRF3ZRILAQ",
+    "CAACAgIAAxkBAAIBm2Rx1ySiJV4dVeTuCTc-RfFDnfQpAAIXAAO0yXAAAA3Vm7IiJdisLAQ",
+    "CAACAgIAAxkBAAIBnGRx1yT_jVlWt5xPJ7BO9aQ4JvFaAAIYAAO0yXAAAA0k9GZDQpLcLAQ",
+]
+
+import random
 
 
-# ─────────────────────────────────────────────
-#  MAIN ENTRY POINT
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 2 — MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════
 
 async def main(event=None, context=None):
-    print("[INFO] ═══════════════════════════════════")
-    print("[INFO] Fashion News Bot started")
-    print(f"[INFO] Time: {datetime.now(timezone.utc).isoformat()}")
-    print("[INFO] ═══════════════════════════════════")
+    print("[INFO] ══════════════════════════════════════")
+    print("[INFO] Fashion News Bot v10.0 started")
+    print(f"[INFO] {datetime.now(timezone.utc).isoformat()}")
+    print("[INFO] ══════════════════════════════════════")
 
-    # Load environment variables
-    config = load_config()
+    config = _load_config()
     if not config:
         return {"status": "error", "reason": "missing_env_vars"}
 
-    bot = Bot(token=config['token'])
-    appwrite = AppwriteClient(
-        endpoint=config['endpoint'],
-        project=config['project'],
-        key=config['key'],
-        database_id=config['database_id'],
-        collection_id=config['collection_id'],
+    bot      = Bot(token=config["token"])
+    appwrite = _AppwriteClient(
+        endpoint      = config["endpoint"],
+        project       = config["project"],
+        key           = config["key"],
+        database_id   = config["database_id"],
+        collection_id = config["collection_id"],
     )
 
-    now = datetime.now(timezone.utc)
+    now            = datetime.now(timezone.utc)
     time_threshold = now - timedelta(hours=HOURS_THRESHOLD)
-    posted = False
-    total_checked = 0
-    total_skipped_time = 0
-    total_skipped_filter = 0
-    total_skipped_duplicate = 0
+
+    stats = {
+        "checked":   0,
+        "skip_time": 0,
+        "skip_filt": 0,
+        "skip_dupe": 0,
+        "posted":    False,
+    }
 
     for feed_url in RSS_FEEDS:
-        if posted:
+        if stats["posted"]:
             break
 
-        print(f"\n[FEED] Checking: {feed_url}")
-        entries = fetch_feed_entries(feed_url)
-
+        print(f"\n[FEED] {feed_url}")
+        entries = _fetch_feed(feed_url)
         if not entries:
             continue
 
         for entry in entries:
-            if posted:
+            if stats["posted"]:
                 break
 
-            total_checked += 1
+            stats["checked"] += 1
 
-            # ── 1. Parse basic fields ──────────────────────────
-            title = clean_text(entry.get('title', ''))
-            link = clean_text(entry.get('link', ''))
-
+            # ── Parse ──
+            title = _clean(entry.get("title", ""))
+            link  = _clean(entry.get("link",  ""))
             if not title or not link:
                 continue
 
-            # ── 2. Time filter ─────────────────────────────────
-            pub_date = parse_entry_date(entry)
+            # ── Time filter ──
+            pub_date = _parse_date(entry)
             if pub_date and pub_date < time_threshold:
-                total_skipped_time += 1
+                stats["skip_time"] += 1
                 continue
 
-            # ── 3. Clean description ───────────────────────────
-            raw = entry.get('summary') or entry.get('description') or ''
-            description = strip_html(raw)
-            description = truncate(description, MAX_DESCRIPTION_LENGTH)
+            # ── Description ──
+            raw  = (entry.get("summary")
+                    or entry.get("description")
+                    or "")
+            desc = _truncate(_strip_html(raw), MAX_DESCRIPTION_CHARS)
 
-            # ── 4. Fashion relevance filter ────────────────────
-            if not is_fashion_related(title, description):
-                total_skipped_filter += 1
-                print(f"[SKIP:filter] {title[:70]}")
+            # ── Fashion filter ──
+            if not _is_fashion(title, desc):
+                stats["skip_filt"] += 1
+                print(f"[SKIP:filter] {title[:65]}")
                 continue
 
-            # ── 5. Duplicate check ─────────────────────────────
-            content_hash = make_hash(title, description)
-
+            # ── Duplicate check ──
+            content_hash = _make_hash(title, desc)
             if appwrite.is_duplicate(link, content_hash):
-                total_skipped_duplicate += 1
-                print(f"[SKIP:duplicate] {title[:70]}")
+                stats["skip_dupe"] += 1
+                print(f"[SKIP:dupe]   {title[:65]}")
                 continue
 
-            # ── 6. Get image ───────────────────────────────────
-            image_url = get_image_from_rss(entry) or get_og_image(link)
+            # ── Collect images ──
+            image_urls = _collect_images(entry, link)
 
-            # ── 7. Build message ───────────────────────────────
-            message = build_message(title, description, link)
+            # ── Build caption ──
+            caption = _build_caption(title, desc, link)
 
-            # ── 8. Send to Telegram ────────────────────────────
-            success = await send_to_telegram(
-                bot=bot,
-                chat_id=config['chat_id'],
-                text=message,
-                image_url=image_url
-            )
+            # ── Post ──
+            success = await _post(bot, config["chat_id"], image_urls, caption)
 
             if success:
-                posted = True
-                print(f"[SUCCESS] Post sent: {title[:70]}")
-
-                # ── 9. Save to database ────────────────────────
-                appwrite.save_record(
-                    link=link,
-                    title=title,
-                    content_hash=content_hash,
-                    created_at=now.isoformat()
+                stats["posted"] = True
+                print(f"[SUCCESS] {title[:65]}")
+                appwrite.save(
+                    link         = link,
+                    title        = title,
+                    content_hash = content_hash,
+                    created_at   = now.isoformat(),
                 )
 
-    # ── Summary ────────────────────────────────────────────────
-    print("\n[INFO] ═══════════════ SUMMARY ════════════════")
-    print(f"[INFO] Total checked  : {total_checked}")
-    print(f"[INFO] Skipped (time) : {total_skipped_time}")
-    print(f"[INFO] Skipped (filter): {total_skipped_filter}")
-    print(f"[INFO] Skipped (dupe) : {total_skipped_duplicate}")
-    print(f"[INFO] Post sent      : {posted}")
-    print("[INFO] ════════════════════════════════════════")
+    # ── Summary ──
+    print("\n[INFO] ─────────── SUMMARY ───────────")
+    print(f"[INFO] Checked  : {stats['checked']}")
+    print(f"[INFO] Skip/time: {stats['skip_time']}")
+    print(f"[INFO] Skip/filt: {stats['skip_filt']}")
+    print(f"[INFO] Skip/dupe: {stats['skip_dupe']}")
+    print(f"[INFO] Posted   : {stats['posted']}")
+    print("[INFO] ──────────────────────────────")
 
-    return {"status": "success", "posted": posted}
+    return {"status": "success", "posted": stats["posted"]}
 
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION LOADER
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 3 — CONFIGURATION LOADER
+# ═══════════════════════════════════════════════════════════
 
-def load_config():
-    """Load and validate all required environment variables."""
-    required = {
-        'token':         os.environ.get('TELEGRAM_BOT_TOKEN'),
-        'chat_id':       os.environ.get('TELEGRAM_CHANNEL_ID'),
-        'endpoint':      os.environ.get('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1'),
-        'project':       os.environ.get('APPWRITE_PROJECT_ID'),
-        'key':           os.environ.get('APPWRITE_API_KEY'),
-        'database_id':   os.environ.get('APPWRITE_DATABASE_ID'),
-        'collection_id': os.environ.get('APPWRITE_COLLECTION_ID', 'history'),
+def _load_config() -> dict | None:
+    cfg = {
+        "token":         os.environ.get("TELEGRAM_BOT_TOKEN"),
+        "chat_id":       os.environ.get("TELEGRAM_CHANNEL_ID"),
+        "endpoint":      os.environ.get("APPWRITE_ENDPOINT",
+                                         "https://cloud.appwrite.io/v1"),
+        "project":       os.environ.get("APPWRITE_PROJECT_ID"),
+        "key":           os.environ.get("APPWRITE_API_KEY"),
+        "database_id":   os.environ.get("APPWRITE_DATABASE_ID"),
+        "collection_id": os.environ.get("APPWRITE_COLLECTION_ID", "history"),
     }
-
-    missing = [k for k, v in required.items() if not v]
+    missing = [k for k, v in cfg.items() if not v]
     if missing:
-        print(f"[ERROR] Missing environment variables: {missing}")
+        print(f"[ERROR] Missing env vars: {missing}")
         return None
+    return cfg
 
-    return required
 
+# ═══════════════════════════════════════════════════════════
+# SECTION 4 — APPWRITE CLIENT
+# ═══════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────
-#  APPWRITE CLIENT
-# ─────────────────────────────────────────────
-
-class AppwriteClient:
-    """Handles all Appwrite database operations."""
+class _AppwriteClient:
+    """
+    Thin Appwrite REST wrapper.
+    Uses raw requests — no Appwrite SDK dependency.
+    """
 
     def __init__(self, endpoint, project, key, database_id, collection_id):
-        self.base_url = f"{endpoint}/databases/{database_id}/collections/{collection_id}/documents"
-        self.headers = {
-            'Content-Type': 'application/json',
-            'X-Appwrite-Project': project,
-            'X-Appwrite-Key': key,
+        self._url = (
+            f"{endpoint}/databases/{database_id}"
+            f"/collections/{collection_id}/documents"
+        )
+        self._headers = {
+            "Content-Type":      "application/json",
+            "X-Appwrite-Project": project,
+            "X-Appwrite-Key":    key,
         }
 
     def is_duplicate(self, link: str, content_hash: str) -> bool:
-        """
-        Check if post already exists by link OR content hash.
-        Uses correct Appwrite v1 query format.
-        """
-        # ── Check by link ──────────────────────────────────────
-        if self._query_exists('link', link):
-            return True
+        """Return True if link OR content_hash already in DB."""
+        return (
+            self._exists("link",         link[:500])
+            or self._exists("content_hash", content_hash)
+        )
 
-        # ── Check by content hash ──────────────────────────────
-        if self._query_exists('content_hash', content_hash):
-            return True
-
-        return False
-
-    def _query_exists(self, field: str, value: str) -> bool:
-        """Run an Appwrite equal() query and return True if any document found."""
+    def _exists(self, field: str, value: str) -> bool:
+        """Query Appwrite for a single matching document."""
         try:
-            # ✅ Correct Appwrite REST query format
-            params = {
-                'queries[]': f'equal("{field}", ["{value}"])',
-                'limit': 1,
-            }
-            res = requests.get(
-                self.base_url,
-                headers=self.headers,
-                params=params,
-                timeout=DB_TIMEOUT
+            resp = requests.get(
+                self._url,
+                headers=self._headers,
+                params={
+                    "queries[]": f'equal("{field}", ["{value}"])',
+                    "limit":     1,
+                },
+                timeout=DB_TIMEOUT,
             )
-
-            if res.status_code == 200:
-                return res.json().get('total', 0) > 0
-
-            print(f"[WARN] Appwrite query returned {res.status_code}: {res.text[:100]}")
+            if resp.status_code == 200:
+                return resp.json().get("total", 0) > 0
+            print(f"[WARN] DB query {resp.status_code}: {resp.text[:80]}")
             return False
-
         except requests.RequestException as e:
-            print(f"[WARN] Appwrite query error: {e}")
-            return False  # On network error, don't block posting
+            print(f"[WARN] DB query error ({field}): {e}")
+            return False   # network error → don't block posting
 
-    def save_record(self, link: str, title: str, content_hash: str, created_at: str) -> bool:
-        """
-        Save a new document to Appwrite.
-        ✅ Uses correct Appwrite REST API structure.
-        """
+    def save(self, link: str, title: str,
+             content_hash: str, created_at: str) -> bool:
+        """Write a new record to Appwrite."""
+        doc_id = hashlib.md5(link.encode()).hexdigest()[:20]
         try:
-            # Generate a unique document ID
-            doc_id = hashlib.md5(link.encode()).hexdigest()[:20]
-
-            # ✅ Correct Appwrite document creation payload
-            payload = {
-                'documentId': doc_id,
-                'data': {
-                    'link': link[:500],
-                    'title': title[:300],
-                    'content_hash': content_hash,
-                    'created_at': created_at,
-                }
-            }
-
-            res = requests.post(
-                self.base_url,
-                headers=self.headers,
-                json=payload,
-                timeout=DB_TIMEOUT
+            resp = requests.post(
+                self._url,
+                headers=self._headers,
+                json={
+                    "documentId": doc_id,
+                    "data": {
+                        "link":         link[:500],
+                        "title":        title[:300],
+                        "content_hash": content_hash,
+                        "created_at":   created_at,
+                    },
+                },
+                timeout=DB_TIMEOUT,
             )
-
-            if res.status_code in (200, 201):
-                print("[DB] Record saved successfully")
+            if resp.status_code in (200, 201):
+                print("[DB] Saved.")
                 return True
-            else:
-                print(f"[WARN] DB save failed ({res.status_code}): {res.text[:150]}")
-                return False
-
+            print(f"[WARN] DB save {resp.status_code}: {resp.text[:100]}")
+            return False
         except requests.RequestException as e:
             print(f"[WARN] DB save error: {e}")
             return False
 
 
-# ─────────────────────────────────────────────
-#  RSS FEED FETCHER
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 5 — RSS FEED FETCHER
+# ═══════════════════════════════════════════════════════════
 
-def fetch_feed_entries(url: str) -> list:
+def _fetch_feed(url: str) -> list:
     """
-    Fetch and parse RSS feed entries.
-    Returns empty list on any error.
+    Fetch RSS via requests (with timeout), then parse with feedparser.
+    Returns list of entries, or empty list on any failure.
     """
     try:
-        # feedparser can hang on slow feeds - use requests with timeout first
-        response = requests.get(
+        resp = requests.get(
             url,
             timeout=FEED_TIMEOUT,
             headers={
-                'User-Agent': 'Mozilla/5.0 (compatible; FashionBot/1.0)',
-                'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-            }
+                "User-Agent": "Mozilla/5.0 (compatible; FashionBot/2.0)",
+                "Accept":     "application/rss+xml, application/xml, */*",
+            },
         )
-
-        if response.status_code != 200:
-            print(f"[WARN] Feed returned {response.status_code}: {url}")
+        if resp.status_code != 200:
+            print(f"[WARN] Feed HTTP {resp.status_code}: {url}")
             return []
 
-        feed = feedparser.parse(response.content)
-
+        feed = feedparser.parse(resp.content)
         if feed.bozo and not feed.entries:
             print(f"[WARN] Malformed feed: {url}")
             return []
 
-        entries = feed.entries
-        print(f"[INFO] Found {len(entries)} entries in feed")
-        return entries
+        print(f"[INFO] {len(feed.entries)} entries found.")
+        return feed.entries
 
     except requests.RequestException as e:
-        print(f"[ERROR] Feed fetch failed ({url}): {e}")
+        print(f"[ERROR] Feed fetch: {e}")
         return []
     except Exception as e:
-        print(f"[ERROR] Feed parse error ({url}): {e}")
+        print(f"[ERROR] Feed parse: {e}")
         return []
 
 
-# ─────────────────────────────────────────────
-#  TEXT UTILITIES
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 6 — TEXT UTILITIES
+# ═══════════════════════════════════════════════════════════
 
-def clean_text(text: str) -> str:
-    """Strip whitespace and normalize."""
-    return (text or '').strip()
+def _clean(text: str) -> str:
+    return (text or "").strip()
 
 
-def strip_html(html: str) -> str:
-    """Remove HTML tags and return clean text."""
+def _strip_html(html: str) -> str:
     if not html:
-        return ''
-    soup = BeautifulSoup(html, 'lxml')
-    # Remove script and style elements
-    for tag in soup(['script', 'style', 'iframe']):
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "iframe"]):
         tag.decompose()
-    return ' '.join(soup.get_text(separator=' ').split())
+    return " ".join(soup.get_text(separator=" ").split())
 
 
-def truncate(text: str, max_length: int) -> str:
-    """Truncate text at word boundary."""
-    if len(text) <= max_length:
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
         return text
-    truncated = text[:max_length]
-    last_space = truncated.rfind(' ')
-    if last_space > max_length * 0.8:
-        truncated = truncated[:last_space]
-    return truncated + '...'
+    cut = text[:limit]
+    last_space = cut.rfind(" ")
+    if last_space > limit * 0.8:
+        cut = cut[:last_space]
+    return cut + "…"
 
 
-def make_hash(title: str, description: str) -> str:
-    """Create SHA256 hash for duplicate detection."""
-    content = f"{title.lower().strip()} {description[:150].lower().strip()}"
-    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+def _make_hash(title: str, desc: str) -> str:
+    raw = f"{title.lower().strip()} {desc[:150].lower().strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def parse_entry_date(entry) -> datetime | None:
-    """Safely parse RSS entry date to UTC datetime."""
-    for field in ('published_parsed', 'updated_parsed'):
+def _parse_date(entry) -> datetime | None:
+    for field in ("published_parsed", "updated_parsed"):
         parsed = entry.get(field)
         if parsed:
             try:
                 return datetime(*parsed[:6], tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 continue
-    return None  # No date = don't skip (be inclusive)
+    return None
 
 
-# ─────────────────────────────────────────────
-#  FASHION RELEVANCE FILTER
-# ─────────────────────────────────────────────
+def _escape_html(text: str) -> str:
+    """Escape characters that break Telegram HTML parse_mode."""
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
 
-def is_fashion_related(title: str, description: str) -> bool:
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 7 — FASHION RELEVANCE FILTER
+# ═══════════════════════════════════════════════════════════
+
+def _is_fashion(title: str, desc: str) -> bool:
     """
     Two-stage filter:
-    1. Reject if any negative keyword found
-    2. Accept only if at least one positive keyword found
+      Stage 1 — hard reject if any NEGATIVE keyword found.
+      Stage 2 — accept only if at least one POSITIVE keyword found.
     """
-    combined = (title + ' ' + description).lower()
+    combined = (title + " " + desc).lower()
 
-    # Stage 1: Hard rejection
     for kw in NEGATIVE_KEYWORDS:
         if kw in combined:
             return False
 
-    # Stage 2: Must have fashion content
     for kw in POSITIVE_KEYWORDS:
         if kw in combined:
             return True
@@ -414,169 +456,293 @@ def is_fashion_related(title: str, description: str) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────
-#  IMAGE EXTRACTION
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 8 — IMAGE COLLECTION
+# ═══════════════════════════════════════════════════════════
 
-def get_image_from_rss(entry) -> str | None:
+def _collect_images(entry, article_url: str) -> list[str]:
     """
-    Extract image URL from RSS entry.
-    Handles multiple RSS image formats.
+    Collect up to MAX_IMAGES valid image URLs for an article.
+    Priority order:
+      1. RSS <enclosure> (type=image/*)
+      2. RSS <media:content>
+      3. RSS <media:thumbnail>
+      4. <img> tag in RSS description HTML
+      5. og:image / twitter:image from article page
+    Returns deduplicated list of http(s) URLs.
     """
-    # ── Method 1: <enclosure> tag ──────────────────────────────
-    enclosures = entry.get('enclosures', [])
-    # feedparser sometimes puts single enclosure as entry.enclosure
-    if not enclosures and hasattr(entry, 'enclosure'):
-        enclosures = [entry.enclosure]
+    images = []
+    seen   = set()
 
+    def _add(url: str):
+        url = (url or "").strip()
+        if not url or not url.startswith("http") or url in seen:
+            return
+        lower = url.lower().split("?")[0]
+        # Accept if known image extension or common CDN keywords
+        has_ext  = any(lower.endswith(e) for e in IMAGE_EXTENSIONS)
+        has_word = any(w in url.lower()
+                       for w in ["image", "photo", "img", "media", "cdn"])
+        if not has_ext and not has_word:
+            return
+        seen.add(url)
+        images.append(url)
+
+    # ── 1. Enclosures ──
+    enclosures = entry.get("enclosures", [])
+    if not enclosures and hasattr(entry, "enclosure"):
+        raw = entry.enclosure
+        enclosures = [raw] if raw else []
     for enc in enclosures:
-        if isinstance(enc, dict):
-            mime = enc.get('type', '')
-            url = enc.get('href') or enc.get('url', '')
-        else:
-            mime = getattr(enc, 'type', '')
-            url = getattr(enc, 'href', '') or getattr(enc, 'url', '')
+        mime = enc.get("type", "") if isinstance(enc, dict) else getattr(enc, "type", "")
+        href = (enc.get("href") or enc.get("url", "")) if isinstance(enc, dict) \
+               else (getattr(enc, "href", "") or getattr(enc, "url", ""))
+        if mime.startswith("image/") and href:
+            _add(href)
 
-        if mime.startswith('image/') and url:
-            return url
+    # ── 2. media:content ──
+    for m in entry.get("media_content", []):
+        url    = m.get("url", "")    if isinstance(m, dict) else getattr(m, "url", "")
+        medium = m.get("medium", "") if isinstance(m, dict) else getattr(m, "medium", "")
+        if medium == "image" or any(url.lower().endswith(e) for e in IMAGE_EXTENSIONS):
+            _add(url)
 
-    # ── Method 2: <media:content> tag ─────────────────────────
-    media_content = entry.get('media_content', [])
-    for media in media_content:
-        if isinstance(media, dict):
-            url = media.get('url', '')
-            medium = media.get('medium', '')
-        else:
-            url = getattr(media, 'url', '')
-            medium = getattr(media, 'medium', '')
+    # ── 3. media:thumbnail ──
+    for t in entry.get("media_thumbnail", []):
+        url = t.get("url", "") if isinstance(t, dict) else getattr(t, "url", "")
+        _add(url)
 
-        if url and (medium == 'image' or url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))):
-            return url
+    # ── 4. <img> in description ──
+    if len(images) < MAX_IMAGES:
+        raw_html = (
+            entry.get("summary")
+            or entry.get("description")
+            or (entry.get("content") or [{}])[0].get("value", "")
+        )
+        if raw_html:
+            soup = BeautifulSoup(raw_html, "lxml")
+            for img in soup.find_all("img"):
+                src = img.get("src", "")
+                if src.startswith("http"):
+                    _add(src)
+                if len(images) >= MAX_IMAGES:
+                    break
 
-    # ── Method 3: <media:thumbnail> tag ───────────────────────
-    media_thumbnail = entry.get('media_thumbnail', [])
-    for thumb in media_thumbnail:
-        url = thumb.get('url', '') if isinstance(thumb, dict) else getattr(thumb, 'url', '')
-        if url:
-            return url
+    # ── 5. og:image fallback ──
+    if not images:
+        og = _fetch_og_image(article_url)
+        if og:
+            _add(og)
 
-    # ── Method 4: Image in description HTML ───────────────────
-    raw = entry.get('summary') or entry.get('description') or entry.get('content', [{}])[0].get('value', '')
-    if raw:
-        soup = BeautifulSoup(raw, 'lxml')
-        img = soup.find('img')
-        if img and img.get('src'):
-            src = img['src']
-            if src.startswith('http'):
-                return src
-
-    return None
+    result = images[:MAX_IMAGES]
+    print(f"[INFO] Images collected: {len(result)}")
+    return result
 
 
-def get_og_image(url: str) -> str | None:
-    """Fetch article page and extract og:image meta tag."""
+def _fetch_og_image(url: str) -> str | None:
+    """Fetch article page and extract og:image or twitter:image."""
     try:
-        response = requests.get(
+        resp = requests.get(
             url,
             timeout=PAGE_TIMEOUT,
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            },
+            headers={"User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36"
+            )},
             allow_redirects=True,
         )
-
-        if response.status_code != 200:
+        if resp.status_code != 200:
             return None
-
-        soup = BeautifulSoup(response.text, 'lxml')
-
-        # Try og:image first, then twitter:image
-        for prop in ('og:image', 'twitter:image'):
-            tag = soup.find('meta', property=prop) or soup.find('meta', attrs={'name': prop})
-            if tag and tag.get('content'):
-                img_url = tag['content'].strip()
-                if img_url.startswith('http'):
-                    return img_url
-
-    except requests.RequestException:
-        pass
+        soup = BeautifulSoup(resp.text, "lxml")
+        for prop in ("og:image", "twitter:image"):
+            tag = (
+                soup.find("meta", property=prop)
+                or soup.find("meta", attrs={"name": prop})
+            )
+            if tag and tag.get("content", "").startswith("http"):
+                return tag["content"].strip()
     except Exception:
         pass
-
     return None
 
 
-# ─────────────────────────────────────────────
-#  MESSAGE BUILDER
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 9 — CAPTION BUILDER
+#
+# Magazine-style Persian caption:
+#
+#   💠 <b>Title</b>
+#   ─────────────
+#
+#   Description text (max 350 chars)
+#
+#   🔗 <a href="link">ادامه مطلب</a> | 🆔 @irfashionnews
+#
+#   #مد #استایل #ترند #فشن_ایرانی #زیبایی #fashion #style
+# ═══════════════════════════════════════════════════════════
 
-def build_message(title: str, description: str, link: str) -> str:
+def _build_caption(title: str, desc: str, link: str) -> str:
     """
-    Build clean Persian fashion post.
-    No HTML tags used since parse_mode is set to HTML
-    but we want plain text with emoji formatting.
+    Build HTML caption for Telegram.
+    Hashtags are always the last line.
+    Total length kept under Telegram's 1024-char limit.
     """
-    parts = [f"💠 <b>{title}</b>"]
+    safe_title = _escape_html(title.strip())
+    safe_desc  = _escape_html(desc.strip())
 
-    if description:
-        parts.append(f"\n{description}")
+    parts = [
+        f"💠 <b>{safe_title}</b>",
+        "─────────────",
+        safe_desc,
+        f'🔗 <a href="{link}">ادامه مطلب</a> | 🆔 @irfashionnews',
+        FIXED_HASHTAGS,   # always last
+    ]
 
-    parts.append("\n")
-    parts.append("👗 #مد  ✨ #استایل  🌟 #ترند")
-    parts.append("#فشن_ایرانی  #زیبایی")
-    parts.append(f"\n🔗 <a href='{link}'>ادامه مطلب</a>")
-    parts.append("🆔 @irfashionnews")
+    caption = "\n\n".join(parts)
 
-    return '\n'.join(parts)
+    # Trim description if over limit
+    if len(caption) > 1020:
+        overflow   = len(caption) - 1020
+        safe_desc  = safe_desc[:max(0, len(safe_desc) - overflow - 5)] + "…"
+        parts[2]   = safe_desc
+        caption    = "\n\n".join(parts)
+
+    return caption
 
 
-# ─────────────────────────────────────────────
-#  TELEGRAM SENDER
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECTION 10 — TELEGRAM POSTING
+#
+# GUARANTEED ORDER via reply_to_message_id:
+#
+#   ① send_media_group(all images, no caption)
+#      returned list[Message] → anchor = last.message_id
+#   ② sleep(ALBUM_CAPTION_DELAY = 2.0s)
+#   ③ send_message(caption, reply_to_message_id=anchor)
+#      A reply cannot be delivered before its parent.
+#      Order is enforced at Telegram protocol level.
+#   ④ sleep(STICKER_DELAY = 1.5s)
+#   ⑤ send_sticker(random)  [non-fatal]
+#
+# EDGE CASES:
+#   2+ images  → send_media_group → anchor → reply caption
+#   1  image   → send_photo(no caption) → anchor → reply caption
+#   0  images  → send_message(caption) standalone
+#
+# FALLBACK CHAIN:
+#   send_media_group fails → try single send_photo
+#   send_photo fails       → proceed captionless anchor
+#   send_message fails     → return False
+# ═══════════════════════════════════════════════════════════
 
-async def send_to_telegram(
+async def _post(
     bot: Bot,
     chat_id: str,
-    text: str,
-    image_url: str | None
+    image_urls: list[str],
+    caption: str,
 ) -> bool:
     """
-    Send post to Telegram channel.
-    Falls back from photo → text if image fails.
+    Execute the full post sequence.
+    Returns True if caption was sent successfully.
     """
-    # ── Try sending with photo ─────────────────────────────────
-    if image_url:
+    anchor_msg_id: int | None = None
+
+    # ── Step ①: Send images ────────────────────────────────
+    if len(image_urls) >= 2:
         try:
-            await bot.send_photo(
+            media_group = [
+                InputMediaPhoto(media=url)
+                for url in image_urls[:MAX_IMAGES]
+            ]
+            sent = await bot.send_media_group(
                 chat_id=chat_id,
-                photo=image_url,
-                caption=text,
-                parse_mode='HTML',
+                media=media_group,
                 disable_notification=True,
             )
-            return True
+            # sent is list[Message] — one per image
+            anchor_msg_id = sent[-1].message_id
+            print(
+                f"[INFO] ① Album: {len(sent)} images. "
+                f"anchor={anchor_msg_id}"
+            )
         except TelegramError as e:
-            print(f"[WARN] Photo send failed ({e}), trying text-only...")
+            print(f"[WARN] ① Album failed ({e}). Trying single image...")
+            # Fallback: send first image alone
+            if image_urls:
+                try:
+                    sent = await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=image_urls[0],
+                        disable_notification=True,
+                    )
+                    anchor_msg_id = sent.message_id
+                    print(f"[INFO] ① Fallback single photo. anchor={anchor_msg_id}")
+                except TelegramError as e2:
+                    print(f"[WARN] ① Single photo also failed: {e2}")
 
-    # ── Fallback: text only ────────────────────────────────────
+    elif len(image_urls) == 1:
+        try:
+            sent = await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_urls[0],
+                disable_notification=True,
+            )
+            anchor_msg_id = sent.message_id
+            print(f"[INFO] ① Single photo. anchor={anchor_msg_id}")
+        except TelegramError as e:
+            print(f"[WARN] ① Single photo failed: {e}")
+
+    else:
+        print("[INFO] ① No images — caption will be standalone.")
+
+    # ── Step ②: Hard delay ────────────────────────────────
+    if anchor_msg_id is not None:
+        print(f"[INFO] ② Waiting {ALBUM_CAPTION_DELAY}s...")
+        await asyncio.sleep(ALBUM_CAPTION_DELAY)
+
+    # ── Step ③: Send caption ──────────────────────────────
+    # reply_to_message_id creates a STRUCTURAL dependency.
+    # Telegram cannot deliver a reply before its parent message.
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode='HTML',
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-            disable_notification=True,
-        )
-        return True
+        kwargs: dict = {
+            "chat_id":              chat_id,
+            "text":                 caption,
+            "parse_mode":           "HTML",
+            "link_preview_options": LinkPreviewOptions(is_disabled=True),
+            "disable_notification": True,
+        }
+        if anchor_msg_id is not None:
+            kwargs["reply_to_message_id"] = anchor_msg_id
+
+        await bot.send_message(**kwargs)
+
+        label = f"reply_to={anchor_msg_id}" if anchor_msg_id else "standalone"
+        print(f"[INFO] ③ Caption sent ({label}).")
 
     except TelegramError as e:
-        print(f"[ERROR] Message send failed: {e}")
+        print(f"[ERROR] ③ Caption failed: {e}")
         return False
 
+    # ── Step ④⑤: Sticker (non-fatal) ─────────────────────
+    if FASHION_STICKERS:
+        await asyncio.sleep(STICKER_DELAY)
+        try:
+            await bot.send_sticker(
+                chat_id=chat_id,
+                sticker=random.choice(FASHION_STICKERS),
+                disable_notification=True,
+            )
+            print("[INFO] ⑤ Sticker sent.")
+        except TelegramError as e:
+            # Sticker failure never affects posted=True
+            print(f"[WARN] ⑤ Sticker failed (non-fatal): {e}")
 
-# ─────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────
+    return True
+
+
+# ═══════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     asyncio.run(main())
