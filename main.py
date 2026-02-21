@@ -1,38 +1,45 @@
 # ============================================================
 # Telegram Fashion News Bot — @irfashionnews
-# Version:    13.0 — Full Rewrite, Schema-Correct
+# Version:    14.0 — Production Cloud Function
 # Runtime:    Python 3.12 / Appwrite Cloud Functions
 # Timeout:    120 seconds
 #
-# DB SCHEMA (Appwrite: fashion_db → history):
-#   $id            string (auto/manual)
-#   link           string  1000  required
+# ENV VARS REQUIRED (set in Appwrite Function Settings):
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHANNEL_ID
+#   APPWRITE_ENDPOINT
+#   APPWRITE_PROJECT_ID
+#   APPWRITE_API_KEY
+#   APPWRITE_DATABASE_ID
+#   APPWRITE_COLLECTION_ID  (default: "fashion_db")
+#
+# DB SCHEMA (fashion_db collection):
+#   $id            auto/manual (title_hash[:36])
+#   link           string  1000  required, indexed
 #   title          string  500
 #   published_at   datetime
 #   feed_url       string  500
 #   source_type    string  20
-#   title_hash     string  64
-#   content_hash   string  64
+#   title_hash     string  64   indexed
+#   content_hash   string  64   indexed
 #   category       string  50
 #   trend_score    integer
 #   post_hour      integer
-#   domain_hash    string  64
-#   $createdAt     datetime (auto)
-#   $updatedAt     datetime (auto)
+#   domain_hash    string  64   indexed
+#   $createdAt     auto
+#   $updatedAt     auto
 #
-# DEDUP STRATEGY:
-#   title_hash = SHA-256 of sorted normalized title tokens
-#   content_hash = SHA-256 of normalized title (no description)
-#   domain_hash = SHA-256 of feed domain
-#   Duplicate check: title_hash only (title is canonical identity)
-#   Document ID = title_hash[:36] → Appwrite 409 on conflict
-#   Save BEFORE post → race-condition proof
+# DEDUP: title_hash = SHA-256(sorted normalized title tokens)
+#        content_hash = SHA-256(normalized title, unsorted)
+#        Both EXCLUDE description (it changes across fetches)
+#        Document ID = title_hash[:36] → 409 on conflict
+#        Save BEFORE Telegram post → zero race window
 #
-# ARCHITECTURE:
-#   Phase 1: Fetch all feeds in parallel with retry
-#   Phase 2: Load all title_hashes from DB once (in-memory)
-#   Phase 3: Filter + dedup (in-memory, instant)
-#   Phase 4: Save-then-post for ALL qualifying items
+# FLOW:
+#   Phase 1: Parallel feed fetch with retry (budget: 25s)
+#   Phase 2: Batch load existing hashes from DB (budget: 5s)
+#   Phase 3: Filter + dedup in-memory (instant)
+#   Phase 4: Save-then-post for ALL new items (budget: ~75s)
 # ============================================================
 
 import os
@@ -55,101 +62,148 @@ from telegram.error import TelegramError
 # SECTION 1 — CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 
+# All 23 brand feeds with metadata
 BRAND_FEEDS: list[dict] = [
     {"url": "https://lafemmeroje.com/feed/",
      "brand": "La Femme Roje | لا فم روژ",
      "tag": "#LaFemmeRoje #لافم_روژ",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://salian.ir/feed/",
      "brand": "Salian | سالیان",
      "tag": "#Salian #سالیان",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://celebon.com/feed/",
      "brand": "Celebon | سلبون",
      "tag": "#Celebon #سلبون",
-     "category": "unisex"},
+     "category": "unisex",
+     "source_type": "brand"},
+
     {"url": "https://siawood.com/feed/",
      "brand": "Siawood | سیاوود",
      "tag": "#Siawood #سیاوود",
-     "category": "men"},
+     "category": "men",
+     "source_type": "brand"},
+
     {"url": "https://naghmehkiumarsi.com/feed/",
      "brand": "Naghmeh Kiumarsi | نغمه کیومرثی",
      "tag": "#NaghmehKiumarsi #نغمه_کیومرثی",
-     "category": "designer"},
+     "category": "designer",
+     "source_type": "brand"},
+
     {"url": "https://pooshmode.com/feed/",
      "brand": "Poosh | پوش",
      "tag": "#Poosh #پوش_مد",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://kimiamode.com/feed/",
      "brand": "Kimia | کیمیا",
      "tag": "#Kimia #کیمیا_مد",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://mihanomomosa.com/feed/",
      "brand": "Mihano Momosa | میهانو موموسا",
      "tag": "#MihanoMomosa #میهانو_موموسا",
-     "category": "designer"},
+     "category": "designer",
+     "source_type": "brand"},
+
     {"url": "https://taghcheh.com/feed/",
      "brand": "Taghcheh | طاقچه",
      "tag": "#Taghcheh #طاقچه",
-     "category": "marketplace"},
+     "category": "marketplace",
+     "source_type": "brand"},
+
     {"url": "https://parmimanto.com/feed/",
      "brand": "Parmi Manto | پارمی مانتو",
      "tag": "#ParmiManto #پارمی_مانتو",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://banoosara.com/feed/",
      "brand": "Banoo Sara | بانو سارا",
      "tag": "#BanooSara #بانو_سارا",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://roshanakmode.com/feed/",
      "brand": "Roshanak | رشنک",
      "tag": "#Roshanak #رشنک",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://bodyspinner.com/feed/",
      "brand": "Bodyspinner | بادی اسپینر",
      "tag": "#Bodyspinner #بادی_اسپینر",
-     "category": "activewear"},
+     "category": "activewear",
+     "source_type": "brand"},
+
     {"url": "https://garoudi.com/feed/",
      "brand": "Garoudi | گارودی",
      "tag": "#Garoudi #گارودی",
-     "category": "leather"},
+     "category": "leather",
+     "source_type": "brand"},
+
     {"url": "https://hacoupian.com/feed/",
      "brand": "Hacoupian | هاکوپیان",
      "tag": "#Hacoupian #هاکوپیان",
-     "category": "men"},
+     "category": "men",
+     "source_type": "brand"},
+
     {"url": "https://holidayfashion.ir/feed/",
      "brand": "Holiday | هالیدی",
      "tag": "#Holiday #هالیدی",
-     "category": "unisex"},
+     "category": "unisex",
+     "source_type": "brand"},
+
     {"url": "https://lcman.ir/feed/",
      "brand": "LC Man | ال سی من",
      "tag": "#LCMan #ال_سی_من",
-     "category": "men"},
+     "category": "men",
+     "source_type": "brand"},
+
     {"url": "https://narbon.ir/feed/",
      "brand": "Narbon | ناربن",
      "tag": "#Narbon #ناربن",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://narian.ir/feed/",
      "brand": "Narian | ناریان",
      "tag": "#Narian #ناریان",
-     "category": "women"},
+     "category": "women",
+     "source_type": "brand"},
+
     {"url": "https://patanjameh.com/feed/",
      "brand": "Patan Jameh | پاتان جامه",
      "tag": "#PatanJameh #پاتان_جامه",
-     "category": "traditional"},
+     "category": "traditional",
+     "source_type": "brand"},
+
     {"url": "https://medopia.ir/feed/",
      "brand": "Medopia | مدوپیا",
      "tag": "#Medopia #مدوپیا",
-     "category": "aggregator"},
+     "category": "aggregator",
+     "source_type": "aggregator"},
+
     {"url": "https://www.digistyle.com/mag/feed/",
      "brand": "Digistyle | دیجی‌استایل",
      "tag": "#Digistyle #دیجی_استایل",
-     "category": "aggregator"},
+     "category": "aggregator",
+     "source_type": "aggregator"},
+
     {"url": "https://www.chibepoosham.com/feed/",
      "brand": "Chi Be Poosham | چی بپوشم",
      "tag": "#ChibePooosham #چی_بپوشم",
-     "category": "aggregator"},
+     "category": "aggregator",
+     "source_type": "aggregator"},
 ]
 
+# ── Fashion keywords ──
 POSITIVE_KEYWORDS = [
     'مد', 'فشن', 'استایل', 'زیبایی', 'لباس', 'پوشاک',
     'طراحی لباس', 'ترند', 'کلکسیون', 'برند', 'سیزن',
@@ -180,31 +234,32 @@ FIXED_HASHTAGS = (
 )
 
 # ── Limits ──
-MAX_DESC_CHARS     = 350
-MAX_IMAGES         = 5
-CAPTION_MAX        = 1020
-PUBLISH_BATCH_SIZE = 5
+MAX_DESC_CHARS       = 350
+MAX_IMAGES           = 5
+CAPTION_MAX          = 1020
+MAX_ITEMS_PER_FEED   = 5     # adjustable per feed
+PUBLISH_BATCH_SIZE   = 25    # max total posts per run
 
-# ── Timeouts ──
-GLOBAL_DEADLINE_SEC = 110
-FEED_FETCH_TIMEOUT  = 8
-FEEDS_TOTAL_TIMEOUT = 25
-PAGE_TIMEOUT        = 6
-DB_TIMEOUT          = 5
+# ── Timeouts (seconds) ──
+GLOBAL_DEADLINE_SEC  = 110
+FEED_FETCH_TIMEOUT   = 8
+FEEDS_TOTAL_TIMEOUT  = 25
+PAGE_TIMEOUT         = 6
+DB_TIMEOUT           = 5
 
 # ── Retry ──
-FEED_MAX_RETRIES = 2
-FEED_RETRY_BASE  = 0.5
+FEED_MAX_RETRIES     = 2
+FEED_RETRY_BASE      = 0.5
 
-# ── Weekly window ──
-HOURS_THRESHOLD = 168
+# ── Time window ──
+HOURS_THRESHOLD      = 168   # 7 days
 
-# ── Delays ──
-ALBUM_CAPTION_DELAY = 2.5
-STICKER_DELAY       = 1.5
-INTER_POST_DELAY    = 3.0
+# ── Posting delays ──
+ALBUM_CAPTION_DELAY  = 2.5
+STICKER_DELAY        = 1.5
+INTER_POST_DELAY     = 2.0
 
-# ── Image ──
+# ── Image filtering ──
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
 IMAGE_BLOCKLIST  = [
     'doubleclick', 'googletagmanager', 'googlesyndication',
@@ -212,6 +267,7 @@ IMAGE_BLOCKLIST  = [
     'tracking', 'counter', 'stat.', 'stats.',
 ]
 
+# ── Stickers ──
 FASHION_STICKERS = [
     "CAACAgIAAxkBAAIBmGRx1yRFMVhVqVXLv_dAAXJMOdFNAAIUAAOVgnkAAVGGBbBjxbg4LwQ",
     "CAACAgIAAxkBAAIBmWRx1yRqy9JkN2DmV_Z2sRsKdaTjAAIVAAOVgnkAAc8R3q5p5-AELAQ",
@@ -228,16 +284,17 @@ FASHION_STICKERS = [
 async def main(event=None, context=None):
     _t0 = monotonic()
 
-    def _remaining() -> float:
+    def _time_left() -> float:
         return GLOBAL_DEADLINE_SEC - (monotonic() - _t0)
 
-    print("[INFO] ══════════════════════════════════════")
-    print("[INFO] Fashion Bot v13.0 started")
-    print(f"[INFO] {datetime.now(timezone.utc).isoformat()}")
-    print(f"[INFO] {len(BRAND_FEEDS)} feeds | "
-          f"window={HOURS_THRESHOLD}h | batch={PUBLISH_BATCH_SIZE}")
-    print("[INFO] ══════════════════════════════════════")
+    _log("══════════════════════════════════════════")
+    _log("Fashion Bot v14.0 — Production")
+    _log(f"Time: {datetime.now(timezone.utc).isoformat()}")
+    _log(f"Feeds: {len(BRAND_FEEDS)} | Max/feed: {MAX_ITEMS_PER_FEED} | "
+         f"Batch: {PUBLISH_BATCH_SIZE}")
+    _log("══════════════════════════════════════════")
 
+    # ── Load config from env vars ──
     config = _load_config()
     if not config:
         return {"status": "error", "reason": "missing_env_vars"}
@@ -256,22 +313,28 @@ async def main(event=None, context=None):
     loop           = asyncio.get_event_loop()
 
     stats = {
-        "feeds_ok": 0, "feeds_fail": 0, "feeds_retry": 0,
-        "entries_total": 0,
-        "skip_time": 0, "skip_filter": 0, "skip_dupe": 0,
-        "posted": 0, "errors": 0,
-        "db_timeout": False,
+        "feeds_ok":       0,
+        "feeds_fail":     0,
+        "feeds_retry":    0,
+        "entries_total":  0,
+        "skip_time":      0,
+        "skip_filter":    0,
+        "skip_dupe":      0,
+        "posted":         0,
+        "errors":         0,
+        "db_timeout":     False,
     }
 
-    # ════════════════════════════════════════════════
-    # PHASE 1: Fetch all brand feeds in parallel
-    # ════════════════════════════════════════════════
-    fetch_budget = min(FEEDS_TOTAL_TIMEOUT, _remaining() - 60)
+    # ════════════════════════════════════════════════════
+    # PHASE 1: Fetch all 23 feeds in parallel
+    # ════════════════════════════════════════════════════
+    fetch_budget = min(FEEDS_TOTAL_TIMEOUT, _time_left() - 60)
     if fetch_budget < 5:
-        print("[WARN] Not enough time for feeds")
-        return _build_response(stats)
+        _log("Not enough time for feeds", level="WARN")
+        return _response(stats)
 
-    print(f"\n[PHASE 1] Fetching feeds (budget={fetch_budget:.1f}s)")
+    _log(f"\n[PHASE 1] Fetching {len(BRAND_FEEDS)} feeds "
+         f"(budget={fetch_budget:.1f}s)")
 
     try:
         all_items = await asyncio.wait_for(
@@ -279,90 +342,107 @@ async def main(event=None, context=None):
             timeout=fetch_budget,
         )
     except asyncio.TimeoutError:
-        print("[WARN] Feed fetch timed out — partial results")
+        _log("Feed fetch timed out — using partial", level="WARN")
         all_items = []
 
     stats["entries_total"] = len(all_items)
-    print(f"[PHASE 1] Done: {len(all_items)} entries from "
-          f"{stats['feeds_ok']}/{len(BRAND_FEEDS)} feeds "
-          f"[{_remaining():.1f}s left]")
+    _log(f"[PHASE 1] Done: {len(all_items)} entries from "
+         f"{stats['feeds_ok']}/{len(BRAND_FEEDS)} feeds "
+         f"({stats['feeds_fail']} failed, {stats['feeds_retry']} retries) "
+         f"[{_time_left():.1f}s left]")
 
     if not all_items:
-        return _build_response(stats)
+        _log("No entries found. Exiting.")
+        return _response(stats)
 
     # Sort newest first
     all_items.sort(
-        key=lambda x: x["pub_date"] or datetime.min.replace(
-            tzinfo=timezone.utc),
+        key=lambda x: x["pub_date"] or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
 
-    # ════════════════════════════════════════════════
-    # PHASE 2: Load existing title_hashes from DB
-    # ════════════════════════════════════════════════
-    known_hashes: set[str] = set()
-    known_links:  set[str] = set()
+    # ════════════════════════════════════════════════════
+    # PHASE 2: Load existing hashes from DB (ONE call)
+    # ════════════════════════════════════════════════════
+    known_title_hashes:   set[str] = set()
+    known_content_hashes: set[str] = set()
+    known_links:          set[str] = set()
 
-    db_budget = min(DB_TIMEOUT, _remaining() - 50)
+    db_budget = min(DB_TIMEOUT, _time_left() - 50)
     if db_budget > 2:
-        print(f"\n[PHASE 2] Loading DB state (budget={db_budget:.1f}s)")
+        _log(f"\n[PHASE 2] Loading DB state (budget={db_budget:.1f}s)")
         try:
-            raw = await asyncio.wait_for(
-                loop.run_in_executor(None, db.load_recent, 500),
+            raw_records = await asyncio.wait_for(
+                loop.run_in_executor(None, db.load_recent, 1000),
                 timeout=db_budget,
             )
-            for rec in raw:
-                if rec.get("title_hash"):
-                    known_hashes.add(rec["title_hash"])
-                if rec.get("link"):
-                    known_links.add(rec["link"])
-            print(f"[PHASE 2] Done: {len(raw)} records → "
-                  f"{len(known_hashes)} hashes, {len(known_links)} links "
-                  f"[{_remaining():.1f}s left]")
+            for rec in raw_records:
+                th = rec.get("title_hash", "")
+                ch = rec.get("content_hash", "")
+                lk = rec.get("link", "")
+                if th:
+                    known_title_hashes.add(th)
+                if ch:
+                    known_content_hashes.add(ch)
+                if lk:
+                    known_links.add(lk)
+
+            _log(f"[PHASE 2] Done: {len(raw_records)} records → "
+                 f"{len(known_title_hashes)} title_hashes, "
+                 f"{len(known_content_hashes)} content_hashes, "
+                 f"{len(known_links)} links "
+                 f"[{_time_left():.1f}s left]")
         except asyncio.TimeoutError:
             stats["db_timeout"] = True
-            print("[WARN] DB load timed out — relying on save-based 409")
+            _log("DB load timed out — fallback to 409-based dedup",
+                 level="WARN")
         except Exception as e:
             stats["db_timeout"] = True
-            print(f"[ERROR] DB load: {e}")
+            _log(f"DB load error: {e}", level="ERROR")
     else:
-        print("[WARN] No budget for DB load")
+        _log("No budget for DB load", level="WARN")
 
-    local_posted: set[str] = set()
+    # In-process dedup set (prevents same-run duplicates)
+    posted_hashes: set[str] = set()
 
-    # ════════════════════════════════════════════════
-    # PHASE 3: Filter + Dedup + Post ALL qualifying
-    # ════════════════════════════════════════════════
-    print(f"\n[PHASE 3] Processing {len(all_items)} entries")
+    # ════════════════════════════════════════════════════
+    # PHASE 3: Filter + Dedup + Post ALL new items
+    # ════════════════════════════════════════════════════
+    _log(f"\n[PHASE 3] Processing {len(all_items)} entries "
+         f"(max {PUBLISH_BATCH_SIZE} posts)")
 
     for item in all_items:
-        if _remaining() < 20:
-            print(f"[INFO] Time budget low ({_remaining():.1f}s) — stop")
-            break
-        if stats["posted"] >= PUBLISH_BATCH_SIZE:
-            print(f"[INFO] Batch limit ({PUBLISH_BATCH_SIZE}) reached")
+        # ── Budget check ──
+        if _time_left() < 15:
+            _log(f"Time budget low ({_time_left():.1f}s) — stopping")
             break
 
-        title      = item["title"]
-        link       = item["link"]
-        desc       = item["desc"]
-        pub_date   = item["pub_date"]
-        brand_name = item["brand"]
-        brand_tag  = item["tag"]
-        feed_url   = item["feed_url"]
-        category   = item["category"]
-        entry      = item["entry"]
+        # ── Batch limit ──
+        if stats["posted"] >= PUBLISH_BATCH_SIZE:
+            _log(f"Batch limit ({PUBLISH_BATCH_SIZE}) reached")
+            break
+
+        title       = item["title"]
+        link        = item["link"]
+        desc        = item["desc"]
+        pub_date    = item["pub_date"]
+        brand_name  = item["brand"]
+        brand_tag   = item["tag"]
+        feed_url    = item["feed_url"]
+        category    = item["category"]
+        source_type = item["source_type"]
+        entry_obj   = item["entry"]
+        brand_short = brand_name.split("|")[0].strip()
 
         # ── Time filter ──
         if pub_date and pub_date < time_threshold:
             stats["skip_time"] += 1
             continue
 
-        # ── Fashion filter ──
+        # ── Fashion relevance filter ──
         if not _is_fashion(title, desc, feed_url, brand_name):
             stats["skip_filter"] += 1
-            brand_short = brand_name.split("|")[0].strip()
-            print(f"  [SKIP:filter] [{brand_short}] {title[:50]}")
+            _log(f"  [SKIP:filter] [{brand_short}] {title[:50]}")
             continue
 
         # ── Compute hashes ──
@@ -370,27 +450,30 @@ async def main(event=None, context=None):
         content_hash = _make_content_hash(title)
         domain_hash  = _make_domain_hash(feed_url)
 
-        # ── Dedup: in-process ──
-        if title_hash in local_posted:
+        # ── Dedup 1: in-process (same run) ──
+        if title_hash in posted_hashes:
             stats["skip_dupe"] += 1
             continue
 
-        # ── Dedup: from DB load ──
-        if title_hash in known_hashes:
+        # ── Dedup 2: title_hash from DB ──
+        if title_hash in known_title_hashes:
             stats["skip_dupe"] += 1
-            brand_short = brand_name.split("|")[0].strip()
-            print(f"  [SKIP:dupe:hash] [{brand_short}] {title[:50]}")
+            _log(f"  [SKIP:dupe:title_hash] [{brand_short}] {title[:45]}")
             continue
 
-        # ── Dedup: link ──
+        # ── Dedup 3: content_hash from DB ──
+        if content_hash in known_content_hashes:
+            stats["skip_dupe"] += 1
+            _log(f"  [SKIP:dupe:content_hash] [{brand_short}] {title[:45]}")
+            continue
+
+        # ── Dedup 4: link from DB ──
         if link in known_links:
             stats["skip_dupe"] += 1
-            brand_short = brand_name.split("|")[0].strip()
-            print(f"  [SKIP:dupe:link] [{brand_short}] {title[:50]}")
+            _log(f"  [SKIP:dupe:link] [{brand_short}] {title[:45]}")
             continue
 
-        brand_short = brand_name.split("|")[0].strip()
-        print(f"\n  [CANDIDATE] [{brand_short}] {title[:55]}")
+        _log(f"\n  [NEW] [{brand_short}] {title[:55]}")
 
         # ── Trend score ──
         trend_score = _calc_trend_score(title, desc, brand_name)
@@ -398,18 +481,16 @@ async def main(event=None, context=None):
         # ── Post hour ──
         post_hour = now.hour
 
-        # ── Source type ──
-        source_type = "brand"
-        if category in ("aggregator",):
-            source_type = "aggregator"
-
-        # ── SAVE TO DB BEFORE POSTING (atomic dedup) ──
-        save_budget = min(DB_TIMEOUT, _remaining() - 15)
-        if save_budget < 1:
-            print("[WARN] No time for DB save — stopping")
-            break
-
+        # ── Published at ISO ──
         pub_iso = pub_date.isoformat() if pub_date else now.isoformat()
+
+        # ════════════════════════════════════════
+        # SAVE TO DB BEFORE POSTING (atomic dedup)
+        # ════════════════════════════════════════
+        save_budget = min(DB_TIMEOUT, _time_left() - 10)
+        if save_budget < 1:
+            _log("No time for DB save — stopping", level="WARN")
+            break
 
         try:
             saved = await asyncio.wait_for(
@@ -422,45 +503,56 @@ async def main(event=None, context=None):
                 timeout=save_budget,
             )
         except asyncio.TimeoutError:
-            print("  [WARN] DB save timed out — skipping")
+            _log(f"  DB save timed out [{brand_short}]", level="WARN")
             stats["errors"] += 1
             continue
 
         if not saved:
-            print(f"  [INFO] DB rejected (409/error) — skip")
+            _log(f"  DB rejected (409/error) — already exists")
             stats["skip_dupe"] += 1
             continue
 
-        # Mark in local sets
-        local_posted.add(title_hash)
-        known_hashes.add(title_hash)
+        # Mark in local dedup sets
+        posted_hashes.add(title_hash)
+        known_title_hashes.add(title_hash)
+        known_content_hashes.add(content_hash)
         known_links.add(link)
 
-        # ── Collect images ──
+        # ════════════════════════════════════════
+        # COLLECT IMAGES
+        # ════════════════════════════════════════
         image_urls: list[str] = []
-        img_budget = min(PAGE_TIMEOUT, _remaining() - 12)
+        img_budget = min(PAGE_TIMEOUT, _time_left() - 8)
         if img_budget > 2:
             try:
                 image_urls = await asyncio.wait_for(
                     loop.run_in_executor(
-                        None, _collect_images, entry, link
+                        None, _collect_images, entry_obj, link
                     ),
                     timeout=img_budget,
                 )
             except asyncio.TimeoutError:
-                print("  [WARN] Image collection timed out")
+                _log("  Image scrape timed out", level="WARN")
                 image_urls = []
 
-        # ── Build caption ──
+        # ════════════════════════════════════════
+        # BUILD CAPTION
+        # ════════════════════════════════════════
         caption = _build_caption(
-            title=title, desc=desc, link=link,
-            brand_name=brand_name, brand_tag=brand_tag,
+            title=title,
+            desc=desc,
+            link=link,
+            brand_name=brand_name,
+            brand_tag=brand_tag,
+            pub_date=pub_date,
         )
 
-        # ── Post to Telegram ──
-        tg_budget = min(15, _remaining() - 5)
-        if tg_budget < 5:
-            print("[WARN] No time for Telegram — stopping")
+        # ════════════════════════════════════════
+        # POST TO TELEGRAM
+        # ════════════════════════════════════════
+        tg_budget = min(15, _time_left() - 3)
+        if tg_budget < 4:
+            _log("No time for Telegram — stopping", level="WARN")
             break
 
         try:
@@ -471,71 +563,82 @@ async def main(event=None, context=None):
                 timeout=tg_budget,
             )
         except asyncio.TimeoutError:
-            print("  [WARN] Telegram post timed out")
+            _log("  Telegram post timed out", level="WARN")
             success = False
 
         if success:
             stats["posted"] += 1
-            print(f"  [SUCCESS] Posted #{stats['posted']}: "
-                  f"[{brand_short}] {title[:50]}")
+            _log(f"  [POSTED #{stats['posted']}] [{brand_short}] "
+                 f"{title[:50]}")
 
-            if (_remaining() > 10
+            # Inter-post delay (avoid Telegram flood)
+            if (_time_left() > 8
                     and stats["posted"] < PUBLISH_BATCH_SIZE):
                 await asyncio.sleep(INTER_POST_DELAY)
         else:
             stats["errors"] += 1
+            _log(f"  [FAIL] [{brand_short}] {title[:50]}", level="ERROR")
 
-    # ════════════════════════════════════════════════
-    # Summary
-    # ════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════
+    # SUMMARY
+    # ════════════════════════════════════════════════════
     elapsed = monotonic() - _t0
-    print(f"\n[INFO] ─────────── SUMMARY ({elapsed:.1f}s) ───────────")
-    print(f"[INFO] Feeds        : {stats['feeds_ok']} ok / "
-          f"{stats['feeds_fail']} fail / {stats['feeds_retry']} retries")
-    print(f"[INFO] Entries      : {stats['entries_total']}")
-    print(f"[INFO] Skip/time    : {stats['skip_time']}")
-    print(f"[INFO] Skip/filter  : {stats['skip_filter']}")
-    print(f"[INFO] Skip/dupe    : {stats['skip_dupe']}")
-    print(f"[INFO] Posted       : {stats['posted']}")
-    print(f"[INFO] Errors       : {stats['errors']}")
+    _log(f"\n{'═' * 50}")
+    _log(f"SUMMARY ({elapsed:.1f}s / {GLOBAL_DEADLINE_SEC}s)")
+    _log(f"{'═' * 50}")
+    _log(f"Feeds     : {stats['feeds_ok']} ok | "
+         f"{stats['feeds_fail']} fail | "
+         f"{stats['feeds_retry']} retries")
+    _log(f"Entries   : {stats['entries_total']} total")
+    _log(f"Skip/time : {stats['skip_time']}")
+    _log(f"Skip/filter: {stats['skip_filter']}")
+    _log(f"Skip/dupe : {stats['skip_dupe']}")
+    _log(f"Posted    : {stats['posted']}")
+    _log(f"Errors    : {stats['errors']}")
     if stats["db_timeout"]:
-        print("[WARN] DB timeout occurred")
-    print("[INFO] ──────────────────────────────────────")
+        _log("DB timeout occurred — dedup may be incomplete",
+             level="WARN")
+    _log(f"{'═' * 50}")
 
-    return _build_response(stats)
+    return _response(stats)
 
 
-def _build_response(stats: dict) -> dict:
+def _response(stats: dict) -> dict:
     return {
-        "status":  "success",
-        "posted":  stats.get("posted", 0),
-        "feeds":   stats.get("feeds_ok", 0),
-        "checked": stats.get("entries_total", 0),
-        "dupes":   stats.get("skip_dupe", 0),
-        "errors":  stats.get("errors", 0),
+        "status":        "success",
+        "posted":        stats.get("posted", 0),
+        "feeds_ok":      stats.get("feeds_ok", 0),
+        "feeds_fail":    stats.get("feeds_fail", 0),
+        "entries_total": stats.get("entries_total", 0),
+        "skip_dupe":     stats.get("skip_dupe", 0),
+        "skip_filter":   stats.get("skip_filter", 0),
+        "errors":        stats.get("errors", 0),
     }
 
 
+def _log(msg: str, level: str = "INFO"):
+    print(f"[{level}] {msg}")
+
+
 # ═══════════════════════════════════════════════════════════
-# SECTION 3 — PARALLEL FEED FETCHER
+# SECTION 3 — PARALLEL FEED FETCHER WITH RETRY
 # ═══════════════════════════════════════════════════════════
 
 async def _fetch_all_parallel(
     loop: asyncio.AbstractEventLoop, stats: dict,
 ) -> list[dict]:
+    """Fetch all 23 feeds simultaneously."""
     tasks = [
-        loop.run_in_executor(
-            None, _fetch_brand_retry, info, stats
-        )
+        loop.run_in_executor(None, _fetch_one_feed, info, stats)
         for info in BRAND_FEEDS
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_items: list[dict] = []
     for i, result in enumerate(results):
-        brand = BRAND_FEEDS[i]["brand"]
+        brand = BRAND_FEEDS[i]["brand"].split("|")[0].strip()
         if isinstance(result, Exception):
-            print(f"  [ERROR] {brand.split('|')[0].strip()}: {result}")
+            _log(f"  {brand}: unhandled error: {result}", level="ERROR")
             stats["feeds_fail"] += 1
         elif result is None:
             stats["feeds_fail"] += 1
@@ -543,51 +646,60 @@ async def _fetch_all_parallel(
             all_items.extend(result)
             stats["feeds_ok"] += 1
         else:
+            # Empty list = feed worked but 0 entries
             stats["feeds_ok"] += 1
+
     return all_items
 
 
-def _fetch_brand_retry(
-    feed_info: dict, stats: dict,
-) -> list[dict] | None:
-    url        = feed_info["url"]
-    brand_name = feed_info["brand"]
-    brand_tag  = feed_info["tag"]
-    category   = feed_info.get("category", "unknown")
-    last_error = None
+def _fetch_one_feed(feed_info: dict, stats: dict) -> list[dict] | None:
+    """Blocking. Retries up to FEED_MAX_RETRIES with backoff."""
+    url         = feed_info["url"]
+    brand_name  = feed_info["brand"]
+    brand_tag   = feed_info["tag"]
+    category    = feed_info.get("category", "unknown")
+    source_type = feed_info.get("source_type", "brand")
+    brand_short = brand_name.split("|")[0].strip()
+    last_error  = None
 
     for attempt in range(FEED_MAX_RETRIES):
         try:
             resp = requests.get(
-                url, timeout=FEED_FETCH_TIMEOUT,
+                url,
+                timeout=FEED_FETCH_TIMEOUT,
                 headers={
                     "User-Agent":
-                        "Mozilla/5.0 (compatible; FashionBot/13.0)",
+                        "Mozilla/5.0 (compatible; FashionBot/14.0)",
                     "Accept":
                         "application/rss+xml, application/xml, */*",
                 },
             )
+
             if resp.status_code == 404:
-                brand_short = brand_name.split("|")[0].strip()
-                print(f"  [WARN] {brand_short}: 404")
+                _log(f"  [FEED] {brand_short}: 404 Not Found",
+                     level="WARN")
                 return []
 
             if resp.status_code != 200:
                 last_error = f"HTTP {resp.status_code}"
                 if attempt < FEED_MAX_RETRIES - 1:
                     stats["feeds_retry"] += 1
+                    _log(f"  [FEED] {brand_short}: {last_error} "
+                         f"— retry {attempt + 1}", level="WARN")
                     sleep(FEED_RETRY_BASE * (2 ** attempt))
                     continue
+                _log(f"  [FEED] {brand_short}: {last_error} "
+                     f"after {FEED_MAX_RETRIES} attempts", level="ERROR")
                 return None
 
             feed = feedparser.parse(resp.content)
             if feed.bozo and not feed.entries:
-                brand_short = brand_name.split("|")[0].strip()
-                print(f"  [WARN] {brand_short}: Malformed")
+                _log(f"  [FEED] {brand_short}: Malformed feed",
+                     level="WARN")
                 return []
 
             items = []
-            for entry in feed.entries:
+            for entry in feed.entries[:MAX_ITEMS_PER_FEED]:
                 title = _clean(entry.get("title", ""))
                 link  = _clean(entry.get("link", ""))
                 if not title or not link:
@@ -604,37 +716,40 @@ def _fetch_brand_retry(
                 pub_date = _parse_date(entry)
 
                 items.append({
-                    "title":    title,
-                    "link":     link,
-                    "desc":     desc,
-                    "pub_date": pub_date,
-                    "brand":    brand_name,
-                    "tag":      brand_tag,
-                    "feed_url": url,
-                    "category": category,
-                    "entry":    entry,
+                    "title":       title,
+                    "link":        link,
+                    "desc":        desc,
+                    "pub_date":    pub_date,
+                    "brand":       brand_name,
+                    "tag":         brand_tag,
+                    "feed_url":    url,
+                    "category":    category,
+                    "source_type": source_type,
+                    "entry":       entry,
                 })
 
-            brand_short = brand_name.split("|")[0].strip()
-            suffix = f" (retry {attempt})" if attempt > 0 else ""
-            print(f"  [FEED] {brand_short}: "
-                  f"{len(items)} entries{suffix}")
+            retry_note = f" (retry {attempt})" if attempt > 0 else ""
+            _log(f"  [FEED] {brand_short}: "
+                 f"{len(items)} entries{retry_note}")
             return items
 
         except requests.exceptions.ConnectionError as e:
-            last_error = f"Conn: {str(e)[:60]}"
+            last_error = f"Connection: {str(e)[:60]}"
         except requests.exceptions.Timeout:
             last_error = "Timeout"
         except Exception as e:
-            last_error = str(e)[:80]
+            _log(f"  [FEED] {brand_short}: {str(e)[:80]}",
+                 level="ERROR")
             return None
 
         if attempt < FEED_MAX_RETRIES - 1:
             stats["feeds_retry"] += 1
+            _log(f"  [FEED] {brand_short}: {last_error} "
+                 f"— retry {attempt + 1}", level="WARN")
             sleep(FEED_RETRY_BASE * (2 ** attempt))
 
-    brand_short = brand_name.split("|")[0].strip()
-    print(f"  [ERROR] {brand_short}: Failed: {last_error}")
+    _log(f"  [FEED] {brand_short}: Failed after "
+         f"{FEED_MAX_RETRIES} attempts: {last_error}", level="ERROR")
     return None
 
 
@@ -644,10 +759,10 @@ def _fetch_brand_retry(
 
 class _AppwriteDB:
     """
-    Maps EXACTLY to Appwrite schema:
-      fashion_db → history collection
+    Raw HTTP client for Appwrite REST API.
 
-    Columns used:
+    Collection: fashion_db
+    All field names match EXACTLY:
       link, title, published_at, feed_url, source_type,
       title_hash, content_hash, category, trend_score,
       post_hour, domain_hash
@@ -665,35 +780,56 @@ class _AppwriteDB:
             "X-Appwrite-Key":     key,
         }
 
-    def load_recent(self, limit: int = 500) -> list[dict]:
-        """Load recent records for in-memory dedup."""
-        try:
-            resp = requests.get(
-                self._url,
-                headers=self._headers,
-                params={
-                    "limit": str(limit),
-                    "orderType": "DESC",
-                },
-                timeout=DB_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                print(f"[WARN] DB load: HTTP {resp.status_code}")
-                return []
-            docs = resp.json().get("documents", [])
-            return [
-                {
-                    "link":       d.get("link", ""),
-                    "title":      d.get("title", ""),
-                    "title_hash": d.get("title_hash", ""),
-                }
-                for d in docs
-            ]
-        except requests.exceptions.Timeout:
-            raise
-        except Exception as e:
-            print(f"[ERROR] DB load: {e}")
-            return []
+    def load_recent(self, limit: int = 1000) -> list[dict]:
+        """
+        Batch load recent documents.
+        Returns list of dicts with title_hash, content_hash, link.
+        Single HTTP call — no per-article queries.
+        """
+        all_docs = []
+        offset = 0
+        batch_size = min(limit, 100)  # Appwrite max per request
+
+        while offset < limit:
+            try:
+                resp = requests.get(
+                    self._url,
+                    headers=self._headers,
+                    params={
+                        "limit":  str(batch_size),
+                        "offset": str(offset),
+                    },
+                    timeout=DB_TIMEOUT,
+                )
+                if resp.status_code != 200:
+                    _log(f"DB load: HTTP {resp.status_code}",
+                         level="WARN")
+                    break
+
+                data = resp.json()
+                docs = data.get("documents", [])
+                if not docs:
+                    break
+
+                for d in docs:
+                    all_docs.append({
+                        "title_hash":   d.get("title_hash", ""),
+                        "content_hash": d.get("content_hash", ""),
+                        "link":         d.get("link", ""),
+                    })
+
+                if len(docs) < batch_size:
+                    break  # No more pages
+
+                offset += batch_size
+
+            except requests.exceptions.Timeout:
+                raise  # Let caller handle
+            except Exception as e:
+                _log(f"DB load error: {e}", level="ERROR")
+                break
+
+        return all_docs
 
     def save(
         self,
@@ -710,69 +846,115 @@ class _AppwriteDB:
         domain_hash: str,
     ) -> bool:
         """
-        Save document with title_hash[:36] as ID.
-        409 = already exists (atomic dedup).
+        Save with title_hash[:36] as document ID.
+        409 Conflict = already exists (atomic dedup).
+
         ALL fields match exact Appwrite column names.
         """
         doc_id = title_hash[:36]
+
+        payload = {
+            "documentId": doc_id,
+            "data": {
+                "link":         link[:1000],
+                "title":        title[:500],
+                "title_hash":   title_hash[:64],
+                "content_hash": content_hash[:64],
+                "feed_url":     feed_url[:500],
+                "published_at": published_at,
+                "source_type":  source_type[:20],
+                "category":     category[:50],
+                "trend_score":  trend_score,
+                "post_hour":    post_hour,
+                "domain_hash":  domain_hash[:64],
+            },
+        }
+
         try:
             resp = requests.post(
                 self._url,
                 headers=self._headers,
-                json={
-                    "documentId": doc_id,
-                    "data": {
-                        "link":         link[:1000],
-                        "title":        title[:500],
-                        "title_hash":   title_hash[:64],
-                        "content_hash": content_hash[:64],
-                        "feed_url":     feed_url[:500],
-                        "published_at": published_at,
-                        "source_type":  source_type[:20],
-                        "category":     category[:50],
-                        "trend_score":  trend_score,
-                        "post_hour":    post_hour,
-                        "domain_hash":  domain_hash[:64],
-                    },
+                json=payload,
+                timeout=DB_TIMEOUT,
+            )
+
+            if resp.status_code in (200, 201):
+                _log("  [DB] Saved ✓")
+                return True
+
+            if resp.status_code == 409:
+                _log("  [DB] 409 — duplicate (already exists)")
+                return False
+
+            _log(f"  [DB] Save failed: HTTP {resp.status_code}: "
+                 f"{resp.text[:200]}", level="WARN")
+            return False
+
+        except Exception as e:
+            _log(f"  [DB] Save error: {e}", level="WARN")
+            return False
+
+    def check_exists(self, field: str, value: str) -> bool:
+        """
+        Check if a document with field=value exists.
+        Used as fallback — prefer in-memory checks.
+        """
+        try:
+            resp = requests.get(
+                self._url,
+                headers=self._headers,
+                params={
+                    "queries[]": f'equal("{field}", ["{value}"])',
+                    "limit": "1",
                 },
                 timeout=DB_TIMEOUT,
             )
-            if resp.status_code in (200, 201):
-                print("  [DB] Saved.")
-                return True
-            if resp.status_code == 409:
-                print("  [DB] 409 — already exists")
-                return False
-            print(f"  [WARN] DB save: HTTP {resp.status_code}: "
-                  f"{resp.text[:150]}")
+            if resp.status_code == 200:
+                return resp.json().get("total", 0) > 0
             return False
-        except Exception as e:
-            print(f"  [WARN] DB save: {e}")
+        except Exception:
             return False
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 5 — CONFIG LOADER
+# SECTION 5 — CONFIG LOADER (all from env vars)
 # ═══════════════════════════════════════════════════════════
 
 def _load_config() -> dict | None:
+    """
+    All credentials come from environment variables.
+    Set these in Appwrite Function Settings:
+      TELEGRAM_BOT_TOKEN
+      TELEGRAM_CHANNEL_ID
+      APPWRITE_ENDPOINT
+      APPWRITE_PROJECT_ID
+      APPWRITE_API_KEY
+      APPWRITE_DATABASE_ID
+      APPWRITE_COLLECTION_ID
+    """
     cfg = {
         "token":         os.environ.get("TELEGRAM_BOT_TOKEN"),
         "chat_id":       os.environ.get("TELEGRAM_CHANNEL_ID"),
-        "endpoint":      os.environ.get(
-            "APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1"
-        ),
+        "endpoint":      os.environ.get("APPWRITE_ENDPOINT",
+                                        "https://fra.cloud.appwrite.io/v1"),
         "project":       os.environ.get("APPWRITE_PROJECT_ID"),
         "key":           os.environ.get("APPWRITE_API_KEY"),
         "database_id":   os.environ.get("APPWRITE_DATABASE_ID"),
-        "collection_id": os.environ.get(
-            "APPWRITE_COLLECTION_ID", "history"
-        ),
+        "collection_id": os.environ.get("APPWRITE_COLLECTION_ID",
+                                        "fashion_db"),
     }
+
     missing = [k for k, v in cfg.items() if not v]
     if missing:
-        print(f"[ERROR] Missing env vars: {missing}")
+        _log(f"Missing env vars: {missing}", level="ERROR")
+        _log("Set these in Appwrite Function → Settings → "
+             "Environment Variables", level="ERROR")
         return None
+
+    _log(f"Config loaded: endpoint={cfg['endpoint']} "
+         f"project={cfg['project'][:8]}... "
+         f"db={cfg['database_id'][:8]}... "
+         f"collection={cfg['collection_id']}")
     return cfg
 
 
@@ -785,7 +967,7 @@ def _clean(text: str) -> str:
 
 
 def _strip_html(html: str) -> str:
-    """Safe HTML stripping with fallback."""
+    """Safe HTML stripping — never crashes."""
     if not html:
         return ""
     try:
@@ -794,8 +976,11 @@ def _strip_html(html: str) -> str:
             tag.decompose()
         return " ".join(soup.get_text(separator=" ").split())
     except Exception:
-        # Fallback: regex strip
-        return re.sub(r"<[^>]+>", " ", html).strip()
+        # Regex fallback for malformed HTML
+        try:
+            return re.sub(r"<[^>]+>", " ", html).strip()
+        except Exception:
+            return html.strip()
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -808,44 +993,59 @@ def _truncate(text: str, limit: int) -> str:
     return cut + "…"
 
 
-def _normalize_title(title: str) -> str:
-    """Normalize for hashing: lowercase, no ZWNJ, no punctuation,
-    Persian char normalization, sorted tokens."""
+def _normalize_for_hash(title: str) -> str:
+    """
+    Normalize title for hashing.
+    - Lowercase
+    - Remove ZWNJ and zero-width chars
+    - Persian character normalization
+    - Remove punctuation
+    - Sort tokens (order-independent)
+    """
     if not title:
         return ""
     t = title.lower().strip()
+    # Remove zero-width chars
     t = re.sub(r"[\u200c\u200d\u200e\u200f\ufeff]", "", t)
+    # Persian normalization
     t = t.replace("ي", "ی").replace("ك", "ک")
     t = t.replace("ة", "ه").replace("ؤ", "و")
     t = t.replace("إ", "ا").replace("أ", "ا")
+    t = t.replace("ئ", "ی").replace("ى", "ی")
+    # Remove diacritics
+    t = re.sub(r"[\u064B-\u065F\u0670]", "", t)
+    # Remove punctuation, keep letters + numbers
     t = re.sub(r"[^\w\s\u0600-\u06FF]", " ", t)
+    # Sort tokens for order-independence
     tokens = sorted(t.split())
     return " ".join(tokens)
 
 
 def _make_title_hash(title: str) -> str:
     """
+    PRIMARY dedup key.
     SHA-256 of sorted normalized title tokens.
-    This is the PRIMARY dedup key.
-    No description included — it varies across fetches.
+    Description EXCLUDED — it varies across fetches.
     """
-    canonical = _normalize_title(title)
+    canonical = _normalize_for_hash(title)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _make_content_hash(title: str) -> str:
     """
+    SECONDARY hash for analytics.
     SHA-256 of normalized title (unsorted, preserving order).
-    Secondary hash for analytics — NOT used for dedup.
+    Also excludes description.
     """
     t = title.lower().strip()
     t = re.sub(r"[\u200c\u200d\u200e\u200f\ufeff]", "", t)
     t = t.replace("ي", "ی").replace("ك", "ک")
+    t = t.replace("ة", "ه")
     return hashlib.sha256(t.encode("utf-8")).hexdigest()
 
 
 def _make_domain_hash(feed_url: str) -> str:
-    """SHA-256 of feed domain for grouping/analytics."""
+    """SHA-256 of feed domain for grouping."""
     try:
         domain = urlparse(feed_url).netloc.lower()
     except Exception:
@@ -873,52 +1073,16 @@ def _escape_html(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 7 — TREND SCORE CALCULATOR
-# ═══════════════════════════════════════════════════════════
-
-def _calc_trend_score(
-    title: str, desc: str, brand_name: str,
-) -> int:
-    """
-    Simple trend score based on keyword density.
-    Higher = more fashion-relevant.
-    Stored in DB for analytics/sorting.
-    """
-    combined = (title + " " + desc).lower()
-    score = 0
-
-    for kw in POSITIVE_KEYWORDS:
-        if kw in combined:
-            score += 1
-
-    # Brand mention in own content = baseline relevance
-    brand_parts = [
-        p.strip().lower()
-        for p in brand_name.replace("|", " ").split()
-        if len(p.strip()) >= 4
-    ]
-    for part in brand_parts:
-        if part in combined:
-            score += 2
-
-    # Title keywords worth more
-    title_lower = title.lower()
-    high_value = ['کلکسیون', 'collection', 'new arrival',
-                  'محصول جدید', 'ترند', 'trend', 'lookbook']
-    for kw in high_value:
-        if kw in title_lower:
-            score += 3
-
-    return min(score, 100)  # cap at 100
-
-
-# ═══════════════════════════════════════════════════════════
-# SECTION 8 — FASHION RELEVANCE FILTER
+# SECTION 7 — FASHION FILTER + TREND SCORE
 # ═══════════════════════════════════════════════════════════
 
 def _is_fashion(
     title: str, desc: str, feed_url: str, brand_name: str,
 ) -> bool:
+    """
+    Returns True if content is fashion-relevant.
+    Brand feeds get leniency: brand name in content = pass.
+    """
     combined = (title + " " + desc).lower()
 
     # Hard reject
@@ -926,12 +1090,12 @@ def _is_fashion(
         if kw in combined:
             return False
 
-    # Positive keyword
+    # Positive keyword match
     for kw in POSITIVE_KEYWORDS:
         if kw in combined:
             return True
 
-    # Brand name leniency
+    # Brand name leniency (for brand-specific feeds)
     brand_parts = [
         p.strip().lower()
         for p in brand_name.replace("|", " ").split()
@@ -954,8 +1118,40 @@ def _is_fashion(
     return False
 
 
+def _calc_trend_score(
+    title: str, desc: str, brand_name: str,
+) -> int:
+    """Simple keyword-density score. Stored for analytics."""
+    combined = (title + " " + desc).lower()
+    score = 0
+
+    for kw in POSITIVE_KEYWORDS:
+        if kw in combined:
+            score += 1
+
+    brand_parts = [
+        p.strip().lower()
+        for p in brand_name.replace("|", " ").split()
+        if len(p.strip()) >= 4
+    ]
+    for part in brand_parts:
+        if part in combined:
+            score += 2
+
+    high_value = [
+        'کلکسیون', 'collection', 'new arrival',
+        'محصول جدید', 'ترند', 'trend', 'lookbook',
+    ]
+    title_lower = title.lower()
+    for kw in high_value:
+        if kw in title_lower:
+            score += 3
+
+    return min(score, 100)
+
+
 # ═══════════════════════════════════════════════════════════
-# SECTION 9 — IMAGE COLLECTION
+# SECTION 8 — IMAGE COLLECTION
 # ═══════════════════════════════════════════════════════════
 
 def _collect_images(entry, article_url: str) -> list[str]:
@@ -1044,11 +1240,12 @@ def _collect_images(entry, article_url: str) -> list[str]:
             _add(og)
 
     result = images[:MAX_IMAGES]
-    print(f"  [INFO] Images: {len(result)}")
+    _log(f"  [IMG] {len(result)} images collected")
     return result
 
 
 def _fetch_og_image(url: str) -> str | None:
+    """Fetch article page for og:image. Blocking."""
     try:
         resp = requests.get(
             url, timeout=PAGE_TIMEOUT,
@@ -1073,52 +1270,108 @@ def _fetch_og_image(url: str) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 10 — CAPTION BUILDER
+# SECTION 9 — CAPTION BUILDER
 # ═══════════════════════════════════════════════════════════
 
 def _build_caption(
-    title: str, desc: str, link: str,
-    brand_name: str, brand_tag: str,
+    title: str,
+    desc: str,
+    link: str,
+    brand_name: str,
+    brand_tag: str,
+    pub_date: datetime | None = None,
 ) -> str:
+    """
+    Magazine-style caption:
+      🏷️ Brand Name
+      💠 <b>Title</b>
+      ─────────────
+      Description
+      📅 Publication date
+      🔗 Link | 🆔 @irfashionnews
+      #hashtags
+    """
     safe_brand = _escape_html(brand_name.strip())
     safe_title = _escape_html(title.strip())
     safe_desc  = _escape_html(desc.strip())
     hashtag_line = f"{brand_tag} {FIXED_HASHTAGS}"
 
+    # Format publication date
+    date_line = ""
+    if pub_date:
+        try:
+            date_str = pub_date.strftime("%Y-%m-%d %H:%M UTC")
+            date_line = f"📅 {date_str}"
+        except Exception:
+            pass
+
     parts = [
         f"🏷️ {safe_brand}",
         f"💠 <b>{safe_title}</b>",
         "─────────────",
-        safe_desc,
-        f'🔗 <a href="{link}">ادامه مطلب</a> | '
-        f'🆔 @irfashionnews',
-        hashtag_line,
     ]
+
+    if safe_desc:
+        parts.append(safe_desc)
+
+    if date_line:
+        parts.append(date_line)
+
+    parts.append(
+        f'🔗 <a href="{link}">ادامه مطلب</a> | 🆔 @irfashionnews'
+    )
+    parts.append(hashtag_line)
 
     caption = "\n\n".join(parts)
 
+    # Trim description if over limit
     if len(caption) > CAPTION_MAX:
-        overflow  = len(caption) - CAPTION_MAX
-        safe_desc = safe_desc[
-            :max(0, len(safe_desc) - overflow - 5)
-        ] + "…"
-        parts[3] = safe_desc
-        caption  = "\n\n".join(parts)
+        overflow = len(caption) - CAPTION_MAX
+        if safe_desc:
+            safe_desc = safe_desc[
+                :max(0, len(safe_desc) - overflow - 5)
+            ] + "…"
+            # Rebuild
+            parts_trimmed = [
+                f"🏷️ {safe_brand}",
+                f"💠 <b>{safe_title}</b>",
+                "─────────────",
+            ]
+            if safe_desc:
+                parts_trimmed.append(safe_desc)
+            if date_line:
+                parts_trimmed.append(date_line)
+            parts_trimmed.append(
+                f'🔗 <a href="{link}">ادامه مطلب</a> | '
+                f'🆔 @irfashionnews'
+            )
+            parts_trimmed.append(hashtag_line)
+            caption = "\n\n".join(parts_trimmed)
 
     return caption
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 11 — TELEGRAM POSTING
+# SECTION 10 — TELEGRAM POSTING
 # ═══════════════════════════════════════════════════════════
 
 async def _post_to_telegram(
-    bot: Bot, chat_id: str,
-    image_urls: list[str], caption: str,
+    bot: Bot,
+    chat_id: str,
+    image_urls: list[str],
+    caption: str,
 ) -> bool:
+    """
+    Post flow:
+      ① Images (no caption) → anchor_id
+      ② Sleep(2.5s)
+      ③ Caption message (reply to anchor)
+      ④ Sleep(1.5s)
+      ⑤ Sticker (non-fatal)
+    """
     anchor_msg_id: int | None = None
 
-    # ── Images (no caption) ──
+    # ── ① Images ──
     if len(image_urls) >= 2:
         try:
             media = [
@@ -1126,43 +1379,50 @@ async def _post_to_telegram(
                 for url in image_urls[:MAX_IMAGES]
             ]
             sent = await bot.send_media_group(
-                chat_id=chat_id, media=media,
+                chat_id=chat_id,
+                media=media,
                 disable_notification=True,
             )
             anchor_msg_id = sent[-1].message_id
-            print(f"  [INFO] ① Album: {len(sent)} imgs "
-                  f"anchor={anchor_msg_id}")
+            _log(f"  [TG] ① Album: {len(sent)} images "
+                 f"anchor={anchor_msg_id}")
         except TelegramError as e:
-            print(f"  [WARN] ① Album failed: {e}")
+            _log(f"  [TG] ① Album failed: {e} — trying single",
+                 level="WARN")
             if image_urls:
                 try:
                     s = await bot.send_photo(
-                        chat_id=chat_id, photo=image_urls[0],
+                        chat_id=chat_id,
+                        photo=image_urls[0],
                         disable_notification=True,
                     )
                     anchor_msg_id = s.message_id
+                    _log(f"  [TG] ① Fallback photo "
+                         f"anchor={anchor_msg_id}")
                 except TelegramError as e2:
-                    print(f"  [WARN] ① Fallback photo: {e2}")
+                    _log(f"  [TG] ① Fallback photo failed: {e2}",
+                         level="WARN")
 
     elif len(image_urls) == 1:
         try:
             s = await bot.send_photo(
-                chat_id=chat_id, photo=image_urls[0],
+                chat_id=chat_id,
+                photo=image_urls[0],
                 disable_notification=True,
             )
             anchor_msg_id = s.message_id
-            print(f"  [INFO] ① Photo anchor={anchor_msg_id}")
+            _log(f"  [TG] ① Photo anchor={anchor_msg_id}")
         except TelegramError as e:
-            print(f"  [WARN] ① Photo failed: {e}")
+            _log(f"  [TG] ① Photo failed: {e}", level="WARN")
 
     else:
-        print("  [INFO] ① No images — standalone caption")
+        _log("  [TG] ① No images — standalone caption")
 
-    # ── Delay ──
+    # ── ② Delay ──
     if anchor_msg_id is not None:
         await asyncio.sleep(ALBUM_CAPTION_DELAY)
 
-    # ── Caption (reply to anchor) ──
+    # ── ③ Caption ──
     try:
         kwargs = {
             "chat_id":              chat_id,
@@ -1177,14 +1437,16 @@ async def _post_to_telegram(
             kwargs["reply_to_message_id"] = anchor_msg_id
 
         await bot.send_message(**kwargs)
+
         label = (f"reply_to={anchor_msg_id}"
                  if anchor_msg_id else "standalone")
-        print(f"  [INFO] ③ Caption sent ({label})")
+        _log(f"  [TG] ③ Caption sent ({label})")
+
     except TelegramError as e:
-        print(f"  [ERROR] ③ Caption failed: {e}")
+        _log(f"  [TG] ③ Caption FAILED: {e}", level="ERROR")
         return False
 
-    # ── Sticker (non-fatal) ──
+    # ── ④⑤ Sticker (non-fatal) ──
     if FASHION_STICKERS:
         await asyncio.sleep(STICKER_DELAY)
         try:
@@ -1193,9 +1455,10 @@ async def _post_to_telegram(
                 sticker=random.choice(FASHION_STICKERS),
                 disable_notification=True,
             )
-            print("  [INFO] ⑤ Sticker sent")
+            _log("  [TG] ⑤ Sticker sent")
         except TelegramError as e:
-            print(f"  [WARN] ⑤ Sticker (non-fatal): {e}")
+            _log(f"  [TG] ⑤ Sticker failed (non-fatal): {e}",
+                 level="WARN")
 
     return True
 
